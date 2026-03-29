@@ -1,0 +1,111 @@
+# Experiment 9: Foveated vision with saccadic eye movements
+#
+# The primate visual system doesn't process uniform images — the retina
+# has dense sampling at the fovea and sparse, blurred sampling in the
+# periphery. The brain integrates across saccadic eye movements to build
+# a coherent percept. This experiment tests whether a prediction graph
+# can learn this integration.
+#
+# Graph topology:
+#
+#   Peripheral(0) ──→ Ventral_Gist(2) ──→ Integration(4)
+#                          ↕                    ↕
+#   Foveal(1) ────→ Ventral_Detail(3) ──→ Integration(4)
+#        │
+#        └────→ Where_Next(5) ← Peripheral(0), Integration(4)
+#
+# Node roles:
+#   0: Peripheral — blurry full-field (scene gist, layout, "where are things")
+#   1: Foveal — sharp local crop (identity, detail, "what is this")
+#   2: Ventral_Gist — mid-level scene features from peripheral
+#   3: Ventral_Detail — mid-level object features from foveal
+#   4: Integration — combines both streams
+#   5: Where_Next — predicts NEXT fixation's foveal latent (saccade planning)
+
+experiment: foveated_saccades
+
+# Retinal model
+retina:
+  image_size: 224
+  fovea_size: 64          # diameter of sharp foveal crop (in pixels)
+  fovea_output_size: 64   # resolution of foveal crop fed to encoder
+  peripheral_output_size: 64  # resolution of blurred peripheral view
+  peripheral_blur_sigma: 8.0  # Gaussian blur sigma for periphery
+  num_fixations: 4        # saccades per image
+
+# Saccade policies to test
+saccade_policies:
+  - name: scanpath
+    description: >
+      Sequential scanpath with realistic saccade lengths. Most biologically
+      plausible — consecutive fixations are spatially correlated.
+
+  - name: center_bias
+    description: >
+      Center-biased Gaussian fixations. Captures the human tendency to
+      look near the center of images.
+
+  - name: random
+    description: >
+      Uniformly random fixations. Null model — no spatial structure in
+      the saccade sequence.
+
+graph:
+  encoder_name: vit_small_patch16_224
+  latent_dim: 384
+  predictor_hidden_dim: 512
+  predictor_layers: 2
+  include_feedback: false
+
+data:
+  dataset: cifar100
+  root: ./data
+  batch_size: 64  # smaller batches due to multiple fixations per sample
+  num_workers: 4
+
+training:
+  steps_per_stage: 10000
+  saccade_prediction_steps: 15000
+  lr: 1e-4
+  weight_decay: 0.05
+  log_every: 100
+  checkpoint_dir: ./checkpoints/exp9
+
+eval:
+  probe_epochs: 50
+  num_classes: 100
+  metrics:
+    # Core question: does accuracy improve with more fixations?
+    - integration_vs_num_fixations
+
+    # Specialization: peripheral=gist, foveal=detail
+    - per_node_probe_accuracy
+    - foveal_vs_peripheral_on_fine_grained  # fine-grained classes
+    - foveal_vs_peripheral_on_coarse        # superclass-level
+
+    # Saccade prediction quality
+    - where_next_prediction_loss
+    - does_saccade_policy_affect_integration
+
+    # Combined representation
+    - foveal_plus_peripheral_vs_each_alone
+
+# Key predictions:
+#
+# 1. Integration accuracy increases with fixations (more saccades = more info)
+#    This would show the graph learns to accumulate across eye movements.
+#
+# 2. Peripheral node better at coarse/superclass classification;
+#    foveal node better at fine-grained (subordinate) classification.
+#    This mirrors the known gist/detail dissociation.
+#
+# 3. Where_Next node successfully predicts next foveal latent.
+#    This is the saccade planning / predictive coding result:
+#    the brain anticipates what it will see at the next fixation.
+#
+# 4. Scanpath policy produces better integration than random fixations.
+#    Spatially structured exploration > random sampling.
+#
+# 5. Combined foveal+peripheral should beat either alone,
+#    but the integration node should beat naive concatenation
+#    (because it learned to combine them through the prediction objective).

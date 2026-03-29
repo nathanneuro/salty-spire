@@ -16,6 +16,7 @@ Extending SALT's frozen-teacher paradigm to multi-node cyclic topologies to test
 | 6 | Cortical Cascade | Does SALT's frozen-teacher advantage compound across a V1->V2->V4->Parietal hierarchy? Does order matter? |
 | 7 | Ventral/Dorsal Streams | Does branching topology drive ventral nodes toward identity and dorsal nodes toward motion (double dissociation)? |
 | 8 | Spatial Inductive Bias | A/B: MLP vs Conv vs Topographic vs Cross-attention inter-node projections — do convolutions matter? |
+| 9 | Foveated Saccades | Can a prediction graph integrate across saccadic eye movements, combining sharp foveal detail with blurry peripheral gist? |
 
 ## Quick Start
 
@@ -48,6 +49,10 @@ python -m cyclic_graph_prediction.scripts.run_experiment7 \
 # Experiment 8: spatial inductive bias A/B test
 python -m cyclic_graph_prediction.scripts.run_experiment8 --run_all --device cuda
 python -m cyclic_graph_prediction.scripts.run_experiment8 --predictor conv_k3 --device cuda
+
+# Experiment 9: foveated saccadic vision
+python -m cyclic_graph_prediction.scripts.run_experiment9 \
+    --saccade_policy scanpath --num_fixations 4 --device cuda
 ```
 
 ## Structure
@@ -64,17 +69,20 @@ cyclic_graph_prediction/
 ├── data/
 │   ├── masking.py       # Patch mask generation for multi-node input partitioning
 │   ├── datasets.py      # Dataset wrappers producing per-node masked views
-│   └── temporal.py      # Frame pair generation with synthetic motion transforms
+│   ├── temporal.py      # Frame pair generation with synthetic motion transforms
+│   └── foveated.py     # Foveated retina + saccade policies + eccentricity blur
 ├── trainers/
 │   ├── schedules.py     # Update schedules: simultaneous, round-robin, async Gibbs, wave
 │   ├── trainer.py       # Main training loop with RankMe collapse detection
 │   ├── cortical_cascade.py # Sequential V1->V2->V4->Parietal cascade trainer
 │   ├── dual_stream.py    # 7-node ventral/dorsal branching hierarchy
-│   └── spatial_trainer.py # Trainer for patch-level spatial prediction graphs
+│   ├── spatial_trainer.py # Trainer for patch-level spatial prediction graphs
+│   └── saccade_trainer.py # Foveated saccade integration cascade trainer
 ├── eval/
 │   ├── linear_probe.py  # Linear probing (per-node and concatenated)
 │   ├── specialization.py # CKA-based specialization analysis
-│   └── stream_probing.py # Ventral/dorsal identity-vs-motion probing
+│   ├── stream_probing.py # Ventral/dorsal identity-vs-motion probing
+│   └── saccade_eval.py  # Saccade integration: accuracy vs fixations, gist vs detail
 ├── configs/             # YAML configs for each experiment
 └── scripts/             # Entry-point scripts
 ```
