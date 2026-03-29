@@ -57,8 +57,9 @@ def main():
     parser.add_argument("--fovea_size", type=int, default=64)
     parser.add_argument("--blur_sigma", type=float, default=8.0)
     parser.add_argument("--num_fixations", type=int, default=4)
-    parser.add_argument("--saccade_policy", type=str, default="scanpath",
-                        choices=["random", "center_bias", "scanpath"])
+    parser.add_argument("--saccade_policy", type=str, default="saliency",
+                        choices=["random", "center_bias", "scanpath",
+                                 "saliency", "object_center", "information_gain"])
     parser.add_argument("--steps_per_stage", type=int, default=10000)
     parser.add_argument("--saccade_pred_steps", type=int, default=15000)
     parser.add_argument("--batch_size", type=int, default=64)

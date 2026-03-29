@@ -33,22 +33,48 @@ retina:
   peripheral_blur_sigma: 8.0  # Gaussian blur sigma for periphery
   num_fixations: 4        # saccades per image
 
-# Saccade policies to test
+# Saccade policies to test (ordered from most naive to most intelligent)
 saccade_policies:
-  - name: scanpath
+  # --- Content-agnostic (don't look at the image) ---
+  - name: random
     description: >
-      Sequential scanpath with realistic saccade lengths. Most biologically
-      plausible — consecutive fixations are spatially correlated.
+      Uniformly random fixations. Null model — no spatial structure,
+      no content awareness. The fovea lands on uninformative regions
+      as often as informative ones.
 
   - name: center_bias
     description: >
-      Center-biased Gaussian fixations. Captures the human tendency to
-      look near the center of images.
+      Center-biased Gaussian fixations. Captures the human prior
+      (photographer bias places subjects near center), but doesn't
+      adapt to image content.
 
-  - name: random
+  - name: scanpath
     description: >
-      Uniformly random fixations. Null model — no spatial structure in
-      the saccade sequence.
+      Sequential scanpath with realistic saccade amplitudes (exponential
+      distribution). Spatially correlated fixations, but still content-blind.
+
+  # --- Content-driven (adapt fixations to the specific image) ---
+  - name: saliency
+    description: >
+      Bottom-up saliency: fixate on high-contrast, high-gradient regions.
+      Approximates Itti-Koch saliency using local contrast + color variance +
+      center bias. Includes inhibition-of-return (IOR) so the model doesn't
+      refixate the same spot. This is the "what catches your eye" policy.
+
+  - name: object_center
+    description: >
+      Foreground-biased: fixate on regions that differ from the image border
+      (background prior). Approximates the human tendency to look at objects
+      rather than background/sky/ground. Uses border-contrast heuristic with
+      Gaussian smoothing for blob detection + IOR.
+
+  - name: information_gain
+    description: >
+      Active inference: fixate where the gap between peripheral and foveal
+      information is largest. Computes detail_loss (|sharp - blurry|) weighted
+      by local entropy of the peripheral view. This approximates expected free
+      energy minimization — look where looking would reduce the most uncertainty.
+      The most theoretically principled policy.
 
 graph:
   encoder_name: vit_small_patch16_224
@@ -103,9 +129,16 @@ eval:
 #    This is the saccade planning / predictive coding result:
 #    the brain anticipates what it will see at the next fixation.
 #
-# 4. Scanpath policy produces better integration than random fixations.
-#    Spatially structured exploration > random sampling.
+# 4. Content-driven policies >> content-agnostic:
+#    information_gain ≥ saliency > object_center > scanpath > center_bias > random
+#    Intelligent targeting of the fovea is critical — a saccade to background
+#    is a wasted fixation. This is why saccade planning is one of the most
+#    heavily optimized systems in the primate brain.
 #
 # 5. Combined foveal+peripheral should beat either alone,
 #    but the integration node should beat naive concatenation
 #    (because it learned to combine them through the prediction objective).
+#
+# 6. Saccade prediction (Where_Next) should be harder for content-driven
+#    policies than random (because the targets are image-dependent), but the
+#    learned predictions should be more useful (pointing at informative regions).

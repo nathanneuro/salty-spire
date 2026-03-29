@@ -118,11 +118,316 @@ class ScanpathSaccadePolicy(SaccadePolicy):
         return fixations
 
 
+class SaliencyGuidedPolicy(SaccadePolicy):
+    """Fixate on high-saliency regions computed from the image itself.
+
+    Uses a lightweight saliency measure: local contrast (gradient magnitude)
+    plus center bias. This approximates Itti-Koch saliency without requiring
+    a separate neural network, making it fast and differentiable.
+
+    The saliency map is computed once per image, then fixations are sampled
+    from it sequentially with inhibition-of-return (IOR) to avoid refixating.
+    """
+
+    def __init__(
+        self,
+        image_size: int,
+        fovea_size: int,
+        center_bias_sigma: float = 0.3,
+        ior_radius: float = 0.15,
+        **kwargs,
+    ):
+        super().__init__(image_size, fovea_size, **kwargs)
+        self.center_bias_sigma = center_bias_sigma
+        self.ior_radius = ior_radius  # fraction of image size
+        self._current_saliency = None
+
+    def set_image(self, image: torch.Tensor):
+        """Precompute saliency map for the current image.
+
+        Args:
+            image: [C, H, W] tensor (normalized)
+        """
+        self._current_saliency = self._compute_saliency(image)
+
+    def _compute_saliency(self, image: torch.Tensor) -> np.ndarray:
+        """Compute saliency as gradient magnitude + center bias.
+
+        Captures edges, texture boundaries, and high-contrast regions —
+        the features that drive bottom-up attention in the brain.
+        """
+        C, H, W = image.shape
+        gray = image.mean(dim=0).numpy()  # [H, W]
+
+        # Gradient magnitude (Sobel-like)
+        gy = np.abs(np.diff(gray, axis=0, prepend=gray[:1, :]))
+        gx = np.abs(np.diff(gray, axis=1, prepend=gray[:, :1]))
+        gradient_mag = np.sqrt(gy ** 2 + gx ** 2)
+
+        # Local contrast: std in 16x16 neighborhoods
+        from scipy.ndimage import uniform_filter
+        local_mean = uniform_filter(gray, size=16)
+        local_sq_mean = uniform_filter(gray ** 2, size=16)
+        local_std = np.sqrt(np.maximum(local_sq_mean - local_mean ** 2, 0))
+
+        # Color contrast (channel variance at each pixel)
+        if C >= 3:
+            color_var = image.numpy().var(axis=0)  # [H, W]
+        else:
+            color_var = np.zeros_like(gray)
+
+        # Combine cues
+        saliency = gradient_mag + local_std + 0.5 * color_var
+
+        # Center bias (Gaussian)
+        cy, cx = H / 2, W / 2
+        ys = np.arange(H)
+        xs = np.arange(W)
+        yy, xx = np.meshgrid(ys, xs, indexing="ij")
+        sigma = self.center_bias_sigma * H
+        center_weight = np.exp(-((yy - cy) ** 2 + (xx - cx) ** 2) / (2 * sigma ** 2))
+
+        saliency = saliency * (0.5 + 0.5 * center_weight)
+
+        # Exclude margins where foveal crop can't fit
+        margin = self.half_fovea
+        saliency[:margin, :] = 0
+        saliency[-margin:, :] = 0
+        saliency[:, :margin] = 0
+        saliency[:, -margin:] = 0
+
+        return saliency
+
+    def generate_fixations(self, num_fixations: int) -> list[tuple[int, int]]:
+        if self._current_saliency is None:
+            # Fallback to center-bias if no image set
+            center = self.image_size // 2
+            return [(center, center)] * num_fixations
+
+        saliency = self._current_saliency.copy()
+        H, W = saliency.shape
+        ior_px = int(self.ior_radius * self.image_size)
+
+        fixations = []
+        for _ in range(num_fixations):
+            # Sample proportional to saliency
+            flat = saliency.flatten()
+            total = flat.sum()
+            if total < 1e-10:
+                # Saliency exhausted — fall back to random
+                margin = self.half_fovea
+                y = self.rng.randint(margin, H - margin)
+                x = self.rng.randint(margin, W - margin)
+            else:
+                probs = flat / total
+                idx = self.rng.choice(len(probs), p=probs)
+                y, x = divmod(idx, W)
+
+            fixations.append((int(y), int(x)))
+
+            # Inhibition of return: suppress saliency around this fixation
+            y_lo = max(0, y - ior_px)
+            y_hi = min(H, y + ior_px)
+            x_lo = max(0, x - ior_px)
+            x_hi = min(W, x + ior_px)
+            saliency[y_lo:y_hi, x_lo:x_hi] *= 0.1
+
+        return fixations
+
+
+class ObjectCenterPolicy(SaccadePolicy):
+    """Fixate on salient object regions using simple foreground detection.
+
+    Approximates the human tendency to fixate on objects rather than
+    background. Uses a simple figure-ground separation based on
+    contrast with the image border (background prior).
+
+    First fixation: most salient foreground region.
+    Subsequent: explore other foreground regions with IOR.
+    """
+
+    def __init__(
+        self,
+        image_size: int,
+        fovea_size: int,
+        border_width: int = 16,
+        ior_radius: float = 0.2,
+        **kwargs,
+    ):
+        super().__init__(image_size, fovea_size, **kwargs)
+        self.border_width = border_width
+        self.ior_radius = ior_radius
+        self._current_objectness = None
+
+    def set_image(self, image: torch.Tensor):
+        """Compute objectness map from border-contrast heuristic."""
+        C, H, W = image.shape
+        gray = image.mean(dim=0).numpy()
+
+        # Background model: mean color of border pixels
+        bw = self.border_width
+        border_pixels = np.concatenate([
+            gray[:bw, :].flatten(),
+            gray[-bw:, :].flatten(),
+            gray[:, :bw].flatten(),
+            gray[:, -bw:].flatten(),
+        ])
+        bg_mean = border_pixels.mean()
+        bg_std = max(border_pixels.std(), 1e-6)
+
+        # Objectness = how much each pixel differs from background
+        objectness = np.abs(gray - bg_mean) / bg_std
+
+        # Smooth to get blobs
+        from scipy.ndimage import gaussian_filter
+        objectness = gaussian_filter(objectness, sigma=8)
+
+        # Suppress margins
+        margin = self.half_fovea
+        objectness[:margin, :] = 0
+        objectness[-margin:, :] = 0
+        objectness[:, :margin] = 0
+        objectness[:, -margin:] = 0
+
+        self._current_objectness = objectness
+
+    def generate_fixations(self, num_fixations: int) -> list[tuple[int, int]]:
+        if self._current_objectness is None:
+            center = self.image_size // 2
+            return [(center, center)] * num_fixations
+
+        H, W = self._current_objectness.shape
+        objectness = self._current_objectness.copy()
+        ior_px = int(self.ior_radius * self.image_size)
+        fixations = []
+
+        for _ in range(num_fixations):
+            flat = objectness.flatten()
+            total = flat.sum()
+            if total < 1e-10:
+                margin = self.half_fovea
+                y = self.rng.randint(margin, H - margin)
+                x = self.rng.randint(margin, W - margin)
+            else:
+                probs = flat / total
+                idx = self.rng.choice(len(probs), p=probs)
+                y, x = divmod(idx, W)
+
+            fixations.append((int(y), int(x)))
+
+            # IOR
+            y_lo = max(0, y - ior_px)
+            y_hi = min(H, y + ior_px)
+            x_lo = max(0, x - ior_px)
+            x_hi = min(W, x + ior_px)
+            objectness[y_lo:y_hi, x_lo:x_hi] *= 0.05
+
+        return fixations
+
+
+class InformationGainPolicy(SaccadePolicy):
+    """Fixate where the gap between peripheral and foveal information is largest.
+
+    The intuition: the best place to look is where the blurry peripheral
+    view is most uncertain — where foveating would provide the most
+    new information. This approximates active inference / expected free
+    energy minimization.
+
+    Uses local entropy of the blurred image as a proxy for uncertainty.
+    High peripheral entropy = unpredictable region = worth foveating.
+    """
+
+    def __init__(
+        self,
+        image_size: int,
+        fovea_size: int,
+        blur_sigma: float = 8.0,
+        ior_radius: float = 0.15,
+        **kwargs,
+    ):
+        super().__init__(image_size, fovea_size, **kwargs)
+        self.blur_sigma = blur_sigma
+        self.ior_radius = ior_radius
+        self._uncertainty_map = None
+
+    def set_image(self, image: torch.Tensor):
+        """Compute uncertainty map: where is the peripheral view most uncertain?"""
+        C, H, W = image.shape
+
+        # Create blurred (peripheral) version
+        ks = int(self.blur_sigma * 6) | 1
+        blurred = _gaussian_blur(image.unsqueeze(0), ks, self.blur_sigma).squeeze(0)
+
+        # Information gap: how much detail is lost by blurring?
+        # High difference = region where blurring destroys a lot of info
+        detail_loss = (image - blurred).abs().mean(dim=0).numpy()  # [H, W]
+
+        # Local entropy of the blurred image (proxy for peripheral uncertainty)
+        gray_blur = blurred.mean(dim=0).numpy()
+        # Discretize to estimate local entropy
+        from scipy.ndimage import uniform_filter
+        local_mean = uniform_filter(gray_blur, size=16)
+        local_sq = uniform_filter(gray_blur ** 2, size=16)
+        local_var = np.maximum(local_sq - local_mean ** 2, 1e-8)
+        # Gaussian entropy ∝ log(variance)
+        local_entropy = 0.5 * np.log(local_var + 1e-8)
+
+        # Combine: high detail loss AND high peripheral uncertainty
+        uncertainty = detail_loss * np.maximum(local_entropy - local_entropy.min(), 0)
+
+        # Suppress margins
+        margin = self.half_fovea
+        uncertainty[:margin, :] = 0
+        uncertainty[-margin:, :] = 0
+        uncertainty[:, :margin] = 0
+        uncertainty[:, -margin:] = 0
+
+        self._uncertainty_map = uncertainty
+
+    def generate_fixations(self, num_fixations: int) -> list[tuple[int, int]]:
+        if self._uncertainty_map is None:
+            center = self.image_size // 2
+            return [(center, center)] * num_fixations
+
+        H, W = self._uncertainty_map.shape
+        uncertainty = self._uncertainty_map.copy()
+        ior_px = int(self.ior_radius * self.image_size)
+        fixations = []
+
+        for _ in range(num_fixations):
+            flat = uncertainty.flatten()
+            total = flat.sum()
+            if total < 1e-10:
+                margin = self.half_fovea
+                y = self.rng.randint(margin, H - margin)
+                x = self.rng.randint(margin, W - margin)
+            else:
+                probs = flat / total
+                idx = self.rng.choice(len(probs), p=probs)
+                y, x = divmod(idx, W)
+
+            fixations.append((int(y), int(x)))
+
+            y_lo = max(0, y - ior_px)
+            y_hi = min(H, y + ior_px)
+            x_lo = max(0, x - ior_px)
+            x_hi = min(W, x + ior_px)
+            uncertainty[y_lo:y_hi, x_lo:x_hi] *= 0.1
+
+        return fixations
+
+
 SACCADE_POLICIES = {
     "random": RandomSaccadePolicy,
     "center_bias": CenterBiasSaccadePolicy,
     "scanpath": ScanpathSaccadePolicy,
+    "saliency": SaliencyGuidedPolicy,
+    "object_center": ObjectCenterPolicy,
+    "information_gain": InformationGainPolicy,
 }
+
+# Policies that need set_image() called before generate_fixations()
+IMAGE_ADAPTIVE_POLICIES = {"saliency", "object_center", "information_gain"}
 
 
 # --- Foveated image processing ---
@@ -340,16 +645,22 @@ class FoveatedSaccadeDataset(Dataset):
         else:
             raise ValueError(f"Unknown dataset: {dataset_name}")
 
+        self.saccade_policy_name = saccade_policy
         policy_cls = SACCADE_POLICIES[saccade_policy]
         self.saccade_gen = policy_cls(
             image_size=image_size, fovea_size=fovea_size, seed=seed,
         )
+        self._is_adaptive = saccade_policy in IMAGE_ADAPTIVE_POLICIES
 
     def __len__(self):
         return len(self.dataset)
 
     def __getitem__(self, idx: int) -> dict:
         image, identity_label = self.dataset[idx]  # [C, H, W]
+
+        # For content-driven policies, compute saliency/objectness from image
+        if self._is_adaptive:
+            self.saccade_gen.set_image(image)
 
         # Generate saccade sequence
         fixations = self.saccade_gen.generate_fixations(self.num_fixations)
