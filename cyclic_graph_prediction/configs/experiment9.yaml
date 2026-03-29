@@ -74,7 +74,17 @@ saccade_policies:
       information is largest. Computes detail_loss (|sharp - blurry|) weighted
       by local entropy of the peripheral view. This approximates expected free
       energy minimization — look where looking would reduce the most uncertainty.
-      The most theoretically principled policy.
+
+  # --- Learned (uses a pretrained model's internal representations) ---
+  - name: attention_map
+    description: >
+      Use a pretrained ViT's CLS-token attention map from the last layer
+      as a saccade targeting signal. The CLS token attention tells you
+      "which patches does this model consider most task-relevant." This is
+      the closest analog to the superior colliculus receiving cortical
+      feedback (from FEF / prefrontal) to plan eye movements.
+      Supports configurable: model_name, layer_index, head_reduction
+      (mean/max), and temperature (exploration vs exploitation).
 
 graph:
   encoder_name: vit_small_patch16_224

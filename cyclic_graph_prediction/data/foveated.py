@@ -417,6 +417,221 @@ class InformationGainPolicy(SaccadePolicy):
         return fixations
 
 
+class AttentionMapPolicy(SaccadePolicy):
+    """Use a pretrained ViT's CLS-token attention to guide fixations.
+
+    A pretrained ViT already knows "where to attend" for classification.
+    The CLS token's attention over patches in the last (or a specified)
+    layer gives a task-relevant saliency map — these are the regions
+    the model considers most informative.
+
+    This is analogous to the superior colliculus using cortical feedback
+    (from FEF / prefrontal) to plan saccades. The attention map is
+    essentially a learned saliency map trained on millions of images.
+
+    Supports any timm ViT. The attention maps are extracted once per image
+    at dataset construction time (or cached), not during training.
+    """
+
+    def __init__(
+        self,
+        image_size: int,
+        fovea_size: int,
+        model_name: str = "vit_small_patch16_224",
+        pretrained: bool = True,
+        layer_index: int = -1,
+        head_reduction: str = "mean",
+        ior_radius: float = 0.15,
+        temperature: float = 1.0,
+        **kwargs,
+    ):
+        super().__init__(image_size, fovea_size, **kwargs)
+        self.ior_radius = ior_radius
+        self.temperature = temperature
+        self.layer_index = layer_index
+        self.head_reduction = head_reduction
+        self._attention_map = None
+
+        # Load pretrained ViT
+        import timm
+        self.model = timm.create_model(model_name, pretrained=pretrained)
+        self.model.eval()
+        for p in self.model.parameters():
+            p.requires_grad = False
+
+        self.patch_size = self.model.patch_embed.patch_size
+        if isinstance(self.patch_size, tuple):
+            self.patch_size = self.patch_size[0]
+        self.grid_size = image_size // self.patch_size
+
+    @torch.no_grad()
+    def set_image(self, image: torch.Tensor):
+        """Extract CLS attention map from pretrained ViT.
+
+        The CLS token attention in the last layer tells us which patches
+        the model considers most task-relevant.
+        """
+        # image: [C, H, W] — add batch dim
+        x = image.unsqueeze(0)
+
+        # Forward through patch embedding + transformer blocks
+        # We need attention weights, so we hook into the attention layers
+        attn_weights = []
+
+        def _hook(module, input, output):
+            # timm attention modules store attn weights differently
+            # For most timm ViTs, we can access via the module
+            pass
+
+        # Alternative: use timm's built-in feature extraction
+        # Most timm ViTs support forward with attention output
+        try:
+            attn_map = self._extract_attention_timm(x)
+        except Exception:
+            # Fallback: use gradient-based attribution
+            attn_map = self._extract_gradient_saliency(x)
+
+        self._attention_map = attn_map
+
+    def _extract_attention_timm(self, x: torch.Tensor) -> np.ndarray:
+        """Extract CLS attention from timm ViT via manual forward pass."""
+        B = x.shape[0]
+
+        # Patch embed
+        x_tokens = self.model.patch_embed(x)
+        cls_token = self.model.cls_token.expand(B, -1, -1)
+
+        if hasattr(self.model, 'pos_embed'):
+            x_tokens = torch.cat([cls_token, x_tokens], dim=1)
+            x_tokens = x_tokens + self.model.pos_embed
+        else:
+            x_tokens = torch.cat([cls_token, x_tokens], dim=1)
+
+        if hasattr(self.model, 'pos_drop'):
+            x_tokens = self.model.pos_drop(x_tokens)
+
+        # Run through transformer blocks, capturing attention at target layer
+        blocks = self.model.blocks
+        target_idx = self.layer_index % len(blocks)
+
+        for i, block in enumerate(blocks):
+            if i == target_idx:
+                # Extract attention from this block
+                attn_out = self._forward_block_with_attention(block, x_tokens)
+                x_tokens, attn = attn_out
+            else:
+                x_tokens = block(x_tokens)
+
+        # attn: [B, num_heads, num_tokens, num_tokens]
+        # CLS attention over patches: attn[:, :, 0, 1:] (CLS attending to patches)
+        cls_attn = attn[0, :, 0, 1:]  # [num_heads, num_patches]
+
+        if self.head_reduction == "mean":
+            cls_attn = cls_attn.mean(dim=0)
+        elif self.head_reduction == "max":
+            cls_attn = cls_attn.max(dim=0).values
+        else:
+            cls_attn = cls_attn.mean(dim=0)
+
+        # Reshape to 2D grid
+        grid = cls_attn.reshape(self.grid_size, self.grid_size).numpy()
+
+        # Upsample to image resolution
+        from scipy.ndimage import zoom
+        scale = self.image_size / self.grid_size
+        attn_map = zoom(grid, scale, order=1)
+
+        # Suppress margins
+        margin = self.half_fovea
+        attn_map[:margin, :] = 0
+        attn_map[-margin:, :] = 0
+        attn_map[:, :margin] = 0
+        attn_map[:, -margin:] = 0
+
+        return attn_map
+
+    def _forward_block_with_attention(self, block, x):
+        """Forward through a timm Block, returning (output, attention_weights)."""
+        # Most timm blocks: x = x + attn(norm1(x)); x = x + mlp(norm2(x))
+        residual = x
+        x_norm = block.norm1(x)
+
+        # Access the attention module
+        attn_module = block.attn
+        B, N, C = x_norm.shape
+        qkv = attn_module.qkv(x_norm).reshape(
+            B, N, 3, attn_module.num_heads, C // attn_module.num_heads
+        ).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv.unbind(0)
+
+        attn_weights = (q @ k.transpose(-2, -1)) * attn_module.scale
+        attn_weights = attn_weights.softmax(dim=-1)
+
+        attn_out = (attn_weights @ v).transpose(1, 2).reshape(B, N, C)
+        attn_out = attn_module.proj(attn_out)
+        if hasattr(attn_module, 'proj_drop'):
+            attn_out = attn_module.proj_drop(attn_out)
+
+        x = residual + attn_out
+        x = x + block.mlp(block.norm2(x))
+        return x, attn_weights
+
+    def _extract_gradient_saliency(self, x: torch.Tensor) -> np.ndarray:
+        """Fallback: gradient-based saliency if attention extraction fails."""
+        x_input = x.clone().requires_grad_(True)
+        output = self.model(x_input)
+        # Backprop from max logit
+        max_logit = output.max()
+        max_logit.backward()
+
+        # Gradient magnitude as saliency
+        grad = x_input.grad[0].abs().mean(dim=0).numpy()
+
+        margin = self.half_fovea
+        grad[:margin, :] = 0
+        grad[-margin:, :] = 0
+        grad[:, :margin] = 0
+        grad[:, -margin:] = 0
+        return grad
+
+    def generate_fixations(self, num_fixations: int) -> list[tuple[int, int]]:
+        if self._attention_map is None:
+            center = self.image_size // 2
+            return [(center, center)] * num_fixations
+
+        H, W = self._attention_map.shape
+        # Apply temperature: higher temp = more exploratory, lower = more greedy
+        attn = self._attention_map.copy()
+        if self.temperature != 1.0:
+            attn = np.power(np.maximum(attn, 0), 1.0 / self.temperature)
+
+        ior_px = int(self.ior_radius * self.image_size)
+        fixations = []
+
+        for _ in range(num_fixations):
+            flat = attn.flatten()
+            total = flat.sum()
+            if total < 1e-10:
+                margin = self.half_fovea
+                y = self.rng.randint(margin, H - margin)
+                x = self.rng.randint(margin, W - margin)
+            else:
+                probs = flat / total
+                idx = self.rng.choice(len(probs), p=probs)
+                y, x = divmod(idx, W)
+
+            fixations.append((int(y), int(x)))
+
+            # IOR
+            y_lo = max(0, y - ior_px)
+            y_hi = min(H, y + ior_px)
+            x_lo = max(0, x - ior_px)
+            x_hi = min(W, x + ior_px)
+            attn[y_lo:y_hi, x_lo:x_hi] *= 0.1
+
+        return fixations
+
+
 SACCADE_POLICIES = {
     "random": RandomSaccadePolicy,
     "center_bias": CenterBiasSaccadePolicy,
@@ -424,10 +639,13 @@ SACCADE_POLICIES = {
     "saliency": SaliencyGuidedPolicy,
     "object_center": ObjectCenterPolicy,
     "information_gain": InformationGainPolicy,
+    "attention_map": AttentionMapPolicy,
 }
 
 # Policies that need set_image() called before generate_fixations()
-IMAGE_ADAPTIVE_POLICIES = {"saliency", "object_center", "information_gain"}
+IMAGE_ADAPTIVE_POLICIES = {
+    "saliency", "object_center", "information_gain", "attention_map",
+}
 
 
 # --- Foveated image processing ---
