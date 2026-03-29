@@ -13,6 +13,7 @@ Extending SALT's frozen-teacher paradigm to multi-node cyclic topologies to test
 | 3 | Emergent Specialization | Can graph topology alone drive functional specialization in identical-architecture nodes? |
 | 4 | Recurrent Inference | Does iterative message passing at test time improve representations, especially for degraded inputs? |
 | 5 | Precision Weighting | Do learnable edge precisions discover attention-like modulation and correlate with edge reliability? |
+| 6 | Cortical Cascade | Does SALT's frozen-teacher advantage compound across a V1->V2->V4->Parietal hierarchy? Does order matter? |
 
 ## Quick Start
 
@@ -27,6 +28,13 @@ python -m cyclic_graph_prediction.scripts.run_experiment1 \
 python -m cyclic_graph_prediction.scripts.run_experiment4_inference \
     --checkpoint ./results/exp1/checkpoints/graph_final.pt \
     --max_rounds 10
+
+# Experiment 6: cortical cascade (V1 -> V2 -> V4 -> Parietal)
+python -m cyclic_graph_prediction.scripts.run_experiment6 \
+    --steps_per_stage 10000 --feedback_steps 5000 --device cuda
+
+# Experiment 6 ablation: reverse cascade (Parietal first)
+python -m cyclic_graph_prediction.scripts.run_experiment6 --reverse --device cuda
 ```
 
 ## Structure
@@ -36,13 +44,15 @@ cyclic_graph_prediction/
 ├── models/
 │   ├── node.py          # GraphNode: single encoder in the graph
 │   ├── predictor.py     # LatentPredictor: edge prediction heads + precision weighting
+│   ├── pixel_decoder.py # PixelDecoder: masked pixel reconstruction for V1 stage
 │   └── graph.py         # PredictionGraph: full cyclic topology + message passing
 ├── data/
 │   ├── masking.py       # Patch mask generation for multi-node input partitioning
 │   └── datasets.py      # Dataset wrappers producing per-node masked views
 ├── trainers/
 │   ├── schedules.py     # Update schedules: simultaneous, round-robin, async Gibbs, wave
-│   └── trainer.py       # Main training loop with RankMe collapse detection
+│   ├── trainer.py       # Main training loop with RankMe collapse detection
+│   └── cortical_cascade.py # Sequential V1->V2->V4->Parietal cascade trainer
 ├── eval/
 │   ├── linear_probe.py  # Linear probing (per-node and concatenated)
 │   └── specialization.py # CKA-based specialization analysis

@@ -1,0 +1,126 @@
+# Experiment 6: Cortical cascade — sequential hierarchical training
+# Mimics visual cortex development: V1 -> V2 -> V4 -> Parietal
+# Each area trains on frozen predecessors, like chaining SALT stages
+
+experiment: cortical_cascade
+
+# Cortical hierarchy: V1(0) -> V2(1) -> V4(2) -> Parietal(3)
+graph:
+  encoder_name: vit_small_patch16_224
+  latent_dim: 384
+  predictor_hidden_dim: 512
+  predictor_layers: 2
+  include_feedback: true   # add V2->V1, V4->V2, Parietal->V4 for feedback phase
+  include_skip: false       # optional: V1->V4, Parietal->V1
+
+# Sequential training stages
+stages:
+  - name: stage1_V1_pixel
+    region: V1
+    node_id: 0
+    objective: pixel_reconstruction
+    steps: 10000
+    description: >
+      V1 trains with masked pixel reconstruction (like SALT Stage 1 / VideoMAE).
+      This is the sensory grounding — V1 learns local edge/texture features
+      from the pixel objective, then freezes.
+
+  - name: stage2_V2_from_V1
+    region: V2
+    node_id: 1
+    targets: [0]  # predict frozen V1 latents
+    objective: latent_prediction
+    steps: 10000
+    description: >
+      V2 learns to predict V1's frozen latents. Like SALT Stage 2, but now V2
+      is the student and V1 is the frozen teacher. V2 should learn higher-order
+      features (contour completion, surface properties) that explain V1's
+      representations.
+
+  - name: stage3_V4_from_V2
+    region: V4
+    node_id: 2
+    targets: [1]  # predict frozen V2 latents
+    objective: latent_prediction
+    steps: 10000
+    description: >
+      V4 learns to predict V2's frozen latents. Each stage should build
+      increasingly abstract representations. The key test: does SALT's
+      "weak teacher, strong student" effect compound? V1 was trained on
+      pixels, V2 on V1's latents, V4 on V2's latents — if each stage
+      improves, the cascade amplifies quality.
+
+  - name: stage4_parietal_from_V4
+    region: parietal
+    node_id: 3
+    targets: [2]  # predict frozen V4 latents
+    objective: latent_prediction
+    steps: 10000
+    description: >
+      Parietal cortex — the top of the hierarchy. Should learn the most
+      abstract, relational, and spatially-invariant features.
+
+  - name: stage5_feedback_finetune
+    region: all
+    objective: bidirectional_finetune
+    steps: 5000
+    lr_multiplier: 0.1
+    description: >
+      Optional: unfreeze feedback edges (V2->V1, V4->V2, Parietal->V4)
+      and fine-tune with round-robin. Tests whether top-down prediction
+      further improves after the hierarchy is established.
+
+data:
+  dataset: cifar100
+  root: ./data
+  image_size: 224
+  patch_size: 16
+  visible_fraction: 0.25  # each node sees 25% of patches
+  batch_size: 128
+  num_workers: 4
+
+training:
+  lr: 1e-4
+  weight_decay: 0.05
+  log_every: 100
+  eval_every: 2000
+  checkpoint_dir: ./checkpoints/exp6
+
+# Ablations to run
+ablations:
+  # Does feedback help after cascade?
+  - name: no_feedback
+    include_feedback: false
+    stages: [stage1, stage2, stage3, stage4]  # no stage5
+
+  # Does skipping levels hurt? (V1 -> V4 directly, skip V2)
+  - name: skip_V2
+    stages: [stage1, stage3_from_V1, stage4]
+
+  # Reverse cascade: Parietal first (abstract -> concrete)
+  - name: reverse_cascade
+    order: [parietal, V4, V2, V1]
+    description: >
+      What if we train top-down? Parietal on pixels first, then V4 predicts
+      parietal, etc. The brain develops bottom-up — does order matter?
+
+  # Deeper cascade: add IT and MT
+  - name: six_region
+    regions: [V1, V2, V4, IT, MT, parietal]
+    edges_ff: [[0,1],[1,2],[2,3],[0,4],[4,5],[3,5]]
+    description: >
+      Closer to real macaque connectivity: V1->V2->V4->IT (ventral stream)
+      plus V1->MT->MST/parietal (dorsal stream). Tests whether the cascade
+      principle works on branching hierarchies, not just chains.
+
+eval:
+  # Probe each node individually to see if it matches known cortical function
+  linear_probe_epochs: 50
+  num_classes: 100
+  metrics:
+    - per_node_linear_probe    # each node's individual quality
+    - concatenated_probe       # all nodes together
+    - cascade_amplification    # does quality increase V1 < V2 < V4 < Parietal?
+    - feedback_delta           # how much does stage5 improve over stage4?
+    - rankme_per_node          # collapse detection
+    - cka_hierarchy            # do adjacent areas have higher CKA than distant ones?
