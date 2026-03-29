@@ -14,6 +14,7 @@ from .dual_stream import (
     build_dual_stream_graph,
     build_dual_stream_cascade_stages,
 )
+from .spatial_trainer import SpatialGraphTrainer
 
 __all__ = [
     "SimultaneousSchedule",
@@ -26,4 +27,5 @@ __all__ = [
     "build_cortical_hierarchy",
     "build_dual_stream_graph",
     "build_dual_stream_cascade_stages",
+    "SpatialGraphTrainer",
 ]

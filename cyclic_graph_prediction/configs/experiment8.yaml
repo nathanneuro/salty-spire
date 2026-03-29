@@ -1,0 +1,126 @@
+# Experiment 8: Do convolutions matter? Spatial inductive bias in inter-node projections
+#
+# A/B test of four predictor architectures for the inter-node projection:
+#
+#   A) MLP: per-patch independent linear projection (no spatial interaction)
+#      → Control: zero spatial inductive bias
+#
+#   B) Conv: 2D convolution on the patch grid (local receptive fields)
+#      → CNN-style: spatial locality baked in, translation equivariant
+#      → Closest to Tegmark's topological nets / cortical retinotopy
+#
+#   C) Topographic: each target patch is predicted from a local window
+#      of source patches centered at the corresponding position
+#      → Explicit retinotopic map (V1→V2 biological projection pattern)
+#
+#   D) Cross-attention: target positions attend to all source positions
+#      → ViT-style: learns spatial relationships from data, no locality bias
+#
+# The biological prior: V1→V2 projections are retinotopic (topographic)
+# with local receptive fields (convolutional). If this inductive bias
+# matters, Conv/Topographic should outperform MLP and possibly
+# Cross-attention, especially for spatial tasks.
+
+experiment: spatial_inductive_bias
+
+# All conditions use the same graph topology
+graph:
+  num_nodes: 4
+  topology: ring
+  bidirectional: false
+  encoder_name: vit_small_patch16_224
+
+# Predictor variants to A/B test
+predictor_conditions:
+  - name: mlp_per_patch
+    type: mlp
+    description: >
+      Per-patch MLP, no spatial interaction. Each patch independently projected.
+      Baseline — does spatial structure in the projection help at all?
+    kwargs:
+      hidden_dim: 512
+      num_layers: 2
+
+  - name: conv_k3
+    type: conv
+    description: >
+      3×3 conv on patch grid. Local receptive field, translation equivariant.
+      The CNN hypothesis: locality is the key inductive bias.
+    kwargs:
+      hidden_dim: 256
+      kernel_size: 3
+      num_layers: 2
+
+  - name: conv_k5
+    type: conv
+    description: >
+      5×5 conv — larger receptive field. Tests if RF size matters.
+    kwargs:
+      hidden_dim: 256
+      kernel_size: 5
+      num_layers: 2
+
+  - name: topographic_rf3
+    type: topographic
+    description: >
+      Explicit retinotopic projection. Each target patch predicted from
+      3×3 neighborhood of corresponding source patches.
+      Most biologically faithful to V1→V2 projection.
+    kwargs:
+      receptive_field: 3
+      hidden_dim: 256
+
+  - name: topographic_rf5
+    type: topographic
+    description: >
+      Wider retinotopic field. Tests if the brain's RF sizes are tuned.
+    kwargs:
+      receptive_field: 5
+      hidden_dim: 256
+
+  - name: cross_attention
+    type: cross_attention
+    description: >
+      Full cross-attention. Target patches attend to all source patches.
+      Maximum flexibility, zero locality bias. The ViT hypothesis.
+    kwargs:
+      num_heads: 8
+      num_layers: 2
+
+data:
+  dataset: cifar100
+  root: ./data
+  image_size: 224
+  patch_size: 16
+  visible_fraction: 0.25
+  batch_size: 128
+  num_workers: 4
+
+training:
+  schedule: round_robin
+  steps_per_phase: 1000
+  max_steps: 50000
+  lr: 1e-4
+  weight_decay: 0.05
+  checkpoint_dir: ./checkpoints/exp8
+
+eval:
+  linear_probe_epochs: 50
+  num_classes: 100
+  metrics:
+    - per_node_linear_probe     # rep quality per node
+    - concatenated_probe        # overall quality
+    - rankme                    # collapse detection
+    - convergence_speed         # steps to reach X% accuracy
+    - parameter_efficiency      # accuracy per param (conv uses fewer params than attn)
+
+# Key predictions:
+#
+# 1. Conv ≥ MLP: spatial locality should help, especially for early areas
+# 2. Topographic ≈ Conv: retinotopy is basically convolution with position-specific weights
+# 3. Cross-attention eventually matches Conv but converges slower
+#    (needs to learn locality that Conv gets for free)
+# 4. Conv matters MORE for lower areas (V1→V2) than higher (V4→Parietal)
+#    — biology shows higher areas have larger, less retinotopic RFs
+# 5. On parameter-matched comparison, Conv should be most efficient
+#    (fewer params for same quality, like CNNs vs ViTs at small scale)
