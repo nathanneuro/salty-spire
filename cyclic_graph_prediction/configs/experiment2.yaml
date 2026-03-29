@@ -1,0 +1,67 @@
+# Experiment 2: Weak-node-strong-graph effect
+# Test whether SALT's "weak teacher, strong student" generalizes to graphs
+
+experiment: weak_node_strong_graph
+
+graph:
+  topology: ring
+  bidirectional: false
+  predictor_hidden_dim: 512
+  predictor_layers: 2
+  use_precision: false
+  latent_dim: 384
+
+# Node configurations to test
+node_configs:
+  # Baseline: all same size
+  - name: uniform_small
+    nodes:
+      - {encoder: vit_small_patch16_224, latent_dim: 384}
+      - {encoder: vit_small_patch16_224, latent_dim: 384}
+      - {encoder: vit_small_patch16_224, latent_dim: 384}
+      - {encoder: vit_small_patch16_224, latent_dim: 384}
+
+  # One weak node (tiny), rest normal
+  - name: one_weak
+    nodes:
+      - {encoder: vit_tiny_patch16_224, latent_dim: 384}  # weak
+      - {encoder: vit_small_patch16_224, latent_dim: 384}
+      - {encoder: vit_small_patch16_224, latent_dim: 384}
+      - {encoder: vit_small_patch16_224, latent_dim: 384}
+
+  # Heterogeneous: mimics cortical region size variation
+  - name: heterogeneous
+    nodes:
+      - {encoder: vit_tiny_patch16_224, latent_dim: 384}
+      - {encoder: vit_small_patch16_224, latent_dim: 384}
+      - {encoder: vit_base_patch16_224, latent_dim: 384}
+      - {encoder: vit_small_patch16_224, latent_dim: 384}
+
+  # All weak nodes
+  - name: all_weak
+    nodes:
+      - {encoder: vit_tiny_patch16_224, latent_dim: 384}
+      - {encoder: vit_tiny_patch16_224, latent_dim: 384}
+      - {encoder: vit_tiny_patch16_224, latent_dim: 384}
+      - {encoder: vit_tiny_patch16_224, latent_dim: 384}
+
+data:
+  dataset: cifar100
+  root: ./data
+  image_size: 224
+  patch_size: 16
+  visible_fraction: 0.25
+  batch_size: 128
+  num_workers: 4
+
+training:
+  schedule: round_robin  # use best schedule from Exp 1
+  steps_per_phase: 1000
+  max_steps: 50000
+  lr: 1e-4
+  weight_decay: 0.05
+  checkpoint_dir: ./checkpoints/exp2
+
+eval:
+  linear_probe_epochs: 50
+  num_classes: 100

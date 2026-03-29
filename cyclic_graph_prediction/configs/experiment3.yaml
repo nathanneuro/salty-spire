@@ -1,0 +1,64 @@
+# Experiment 3: Emergent specialization
+# Can mutual prediction on a graph produce functional specialization
+# without explicit task supervision?
+
+experiment: emergent_specialization
+
+graph:
+  topology: ring
+  bidirectional: true  # richer connectivity for specialization
+  latent_dim: 384
+  predictor_hidden_dim: 512
+  predictor_layers: 2
+  use_precision: false
+  # All nodes get SAME input (no masking), only topology differs
+  num_nodes: 6
+
+# All nodes have identical architecture
+node_encoder: vit_small_patch16_224
+
+# Test different topologies
+topologies:
+  - name: ring_6
+    edges: [[0,1],[1,2],[2,3],[3,4],[4,5],[5,0],
+            [1,0],[2,1],[3,2],[4,3],[5,4],[0,5]]
+
+  - name: star  # node 0 is hub
+    edges: [[0,1],[0,2],[0,3],[0,4],[0,5],
+            [1,0],[2,0],[3,0],[4,0],[5,0]]
+
+  - name: hierarchical  # 2 layers
+    edges: [[0,2],[0,3],[1,3],[1,4],[2,5],[3,5],[4,5],
+            [5,2],[5,3],[5,4],[2,0],[3,0],[3,1],[4,1]]
+
+  # Approximate macaque visual cortex connectivity
+  - name: visual_cortex
+    # V1(0)->V2(1), V2->V4(2), V4->IT(3), V1->MT(4), MT->MST(5)
+    # plus feedback connections
+    edges: [[0,1],[1,2],[2,3],[0,4],[4,5],
+            [1,0],[2,1],[3,2],[4,0],[5,4],
+            [1,4],[4,1],[2,5],[5,2],[3,5],[5,3]]
+
+data:
+  dataset: cifar100
+  root: ./data
+  image_size: 224
+  patch_size: 16
+  visible_fraction: 1.0  # full image to all nodes
+  batch_size: 128
+  num_workers: 4
+
+training:
+  schedule: round_robin
+  steps_per_phase: 2000
+  max_steps: 100000
+  lr: 1e-4
+  weight_decay: 0.05
+  checkpoint_dir: ./checkpoints/exp3
+
+eval:
+  specialization_metrics:
+    - pairwise_cka
+    - effective_dimensionality
+    - feature_selectivity
+  num_samples: 4096

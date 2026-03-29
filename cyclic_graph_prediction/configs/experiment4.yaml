@@ -1,0 +1,61 @@
+# Experiment 4: Recurrent inference at test time
+# Test whether iterative message passing improves representation quality
+
+experiment: recurrent_inference
+
+graph:
+  num_nodes: 4
+  topology: ring
+  bidirectional: true
+  encoder_name: vit_small_patch16_224
+  latent_dim: 384
+  predictor_hidden_dim: 512
+  predictor_layers: 2
+  use_precision: false
+
+data:
+  dataset: cifar100
+  root: ./data
+  image_size: 224
+  patch_size: 16
+  visible_fraction: 0.25
+  batch_size: 128
+  num_workers: 4
+
+training:
+  schedule: round_robin
+  steps_per_phase: 1000
+  max_steps: 50000
+  lr: 1e-4
+  weight_decay: 0.05
+  checkpoint_dir: ./checkpoints/exp4
+
+# Test-time message passing rounds
+inference:
+  message_passing_rounds: [0, 1, 2, 3, 5, 10]
+
+# Input degradation conditions for testing robustness
+degradation:
+  conditions:
+    - name: clean
+      type: none
+
+    - name: occluded_25
+      type: random_occlusion
+      fraction: 0.25
+
+    - name: occluded_50
+      type: random_occlusion
+      fraction: 0.50
+
+    - name: gaussian_noise
+      type: additive_noise
+      std: 0.5
+
+    - name: heavy_noise
+      type: additive_noise
+      std: 1.0
+
+eval:
+  linear_probe_epochs: 50
+  num_classes: 100
