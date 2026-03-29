@@ -14,6 +14,7 @@ Extending SALT's frozen-teacher paradigm to multi-node cyclic topologies to test
 | 4 | Recurrent Inference | Does iterative message passing at test time improve representations, especially for degraded inputs? |
 | 5 | Precision Weighting | Do learnable edge precisions discover attention-like modulation and correlate with edge reliability? |
 | 6 | Cortical Cascade | Does SALT's frozen-teacher advantage compound across a V1->V2->V4->Parietal hierarchy? Does order matter? |
+| 7 | Ventral/Dorsal Streams | Does branching topology drive ventral nodes toward identity and dorsal nodes toward motion (double dissociation)? |
 
 ## Quick Start
 
@@ -35,6 +36,13 @@ python -m cyclic_graph_prediction.scripts.run_experiment6 \
 
 # Experiment 6 ablation: reverse cascade (Parietal first)
 python -m cyclic_graph_prediction.scripts.run_experiment6 --reverse --device cuda
+
+# Experiment 7: ventral/dorsal stream specialization (7-node dual stream)
+python -m cyclic_graph_prediction.scripts.run_experiment7 --device cuda
+
+# Experiment 7 control: biased input (ventral=appearance, dorsal=motion)
+python -m cyclic_graph_prediction.scripts.run_experiment7 \
+    --input_strategy per_stream --device cuda
 ```
 
 ## Structure
@@ -48,14 +56,17 @@ cyclic_graph_prediction/
 │   └── graph.py         # PredictionGraph: full cyclic topology + message passing
 ├── data/
 │   ├── masking.py       # Patch mask generation for multi-node input partitioning
-│   └── datasets.py      # Dataset wrappers producing per-node masked views
+│   ├── datasets.py      # Dataset wrappers producing per-node masked views
+│   └── temporal.py      # Frame pair generation with synthetic motion transforms
 ├── trainers/
 │   ├── schedules.py     # Update schedules: simultaneous, round-robin, async Gibbs, wave
 │   ├── trainer.py       # Main training loop with RankMe collapse detection
-│   └── cortical_cascade.py # Sequential V1->V2->V4->Parietal cascade trainer
+│   ├── cortical_cascade.py # Sequential V1->V2->V4->Parietal cascade trainer
+│   └── dual_stream.py    # 7-node ventral/dorsal branching hierarchy
 ├── eval/
 │   ├── linear_probe.py  # Linear probing (per-node and concatenated)
-│   └── specialization.py # CKA-based specialization analysis
+│   ├── specialization.py # CKA-based specialization analysis
+│   └── stream_probing.py # Ventral/dorsal identity-vs-motion probing
 ├── configs/             # YAML configs for each experiment
 └── scripts/             # Entry-point scripts
 ```

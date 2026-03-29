@@ -10,6 +10,10 @@ from .cortical_cascade import (
     build_cascade_stages,
     build_cortical_hierarchy,
 )
+from .dual_stream import (
+    build_dual_stream_graph,
+    build_dual_stream_cascade_stages,
+)
 
 __all__ = [
     "SimultaneousSchedule",
@@ -20,4 +24,6 @@ __all__ = [
     "CorticalCascadeTrainer",
     "build_cascade_stages",
     "build_cortical_hierarchy",
+    "build_dual_stream_graph",
+    "build_dual_stream_cascade_stages",
 ]
