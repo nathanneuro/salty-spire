@@ -1,0 +1,69 @@
+# Experiment 1: Propagation schedules on simple graphs
+# Compare learning dynamics on a 4-node ring with CIFAR-100
+
+experiment: propagation_schedules
+
+# Graph topology
+graph:
+  num_nodes: 4
+  topology: ring
+  bidirectional: false
+  encoder_name: vit_small_patch16_224
+  latent_dim: 384
+  predictor_hidden_dim: 512
+  predictor_layers: 2
+  use_precision: false
+
+# Data
+data:
+  dataset: cifar100
+  root: ./data
+  image_size: 224
+  patch_size: 16
+  visible_fraction: 0.25
+  batch_size: 128
+  num_workers: 4
+
+# Training
+training:
+  max_steps: 50000
+  lr: 1e-4
+  weight_decay: 0.05
+  log_every: 100
+  eval_every: 5000
+  checkpoint_dir: ./checkpoints/exp1
+
+# Schedules to compare (each is a separate run)
+schedules:
+  - name: simultaneous
+    type: simultaneous
+
+  - name: round_robin_1k
+    type: round_robin
+    steps_per_phase: 1000
+
+  - name: round_robin_5k
+    type: round_robin
+    steps_per_phase: 5000
+
+  - name: async_gibbs_p05
+    type: async_gibbs
+    update_prob: 0.5
+
+  - name: async_gibbs_p03
+    type: async_gibbs
+    update_prob: 0.3
+
+  - name: wave_prop_2k
+    type: wave_propagation
+    warmup_steps_per_hop: 2000
+
+# Evaluation
+eval:
+  linear_probe_epochs: 50
+  linear_probe_lr: 0.01
+  num_classes: 100
+  metrics:
+    - linear_probe_accuracy
+    - rankme
+    - convergence_stability

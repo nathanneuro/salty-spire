@@ -1,0 +1,36 @@
+# Experiment 5: Precision weighting and attention
+# Learnable precision weights on graph edges
+
+experiment: precision_weighting
+
+graph:
+  num_nodes: 4
+  topology: ring
+  bidirectional: true
+  encoder_name: vit_small_patch16_224
+  latent_dim: 384
+  predictor_hidden_dim: 512
+  predictor_layers: 2
+  use_precision: true  # key difference
+
+data:
+  dataset: cifar100
+  root: ./data
+  image_size: 224
+  patch_size: 16
+  visible_fraction: 0.25
+  batch_size: 128
+  num_workers: 4
+
+training:
+  schedule: round_robin
+  steps_per_phase: 1000
+  max_steps: 50000
+  lr: 1e-4
+  weight_decay: 0.05
+  checkpoint_dir: ./checkpoints/exp5
+
+eval:
+  linear_probe_epochs: 50
+  num_classes: 100
+  analyze_precision_weights: true

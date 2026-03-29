@@ -1,0 +1,154 @@
+# Experiment 9: Foveated vision with saccadic eye movements
+#
+# The primate visual system doesn't process uniform images — the retina
+# has dense sampling at the fovea and sparse, blurred sampling in the
+# periphery. The brain integrates across saccadic eye movements to build
+# a coherent percept. This experiment tests whether a prediction graph
+# can learn this integration.
+#
+# Graph topology:
+#
+#   Peripheral(0) ──→ Ventral_Gist(2) ──→ Integration(4)
+#                          ↕                    ↕
+#   Foveal(1) ────→ Ventral_Detail(3) ──→ Integration(4)
+#        │
+#        └────→ Where_Next(5) ← Peripheral(0), Integration(4)
+#
+# Node roles:
+#   0: Peripheral — blurry full-field (scene gist, layout, "where are things")
+#   1: Foveal — sharp local crop (identity, detail, "what is this")
+#   2: Ventral_Gist — mid-level scene features from peripheral
+#   3: Ventral_Detail — mid-level object features from foveal
+#   4: Integration — combines both streams
+#   5: Where_Next — predicts NEXT fixation's foveal latent (saccade planning)
+
+experiment: foveated_saccades
+
+# Retinal model
+retina:
+  image_size: 224
+  fovea_size: 64          # diameter of sharp foveal crop (in pixels)
+  fovea_output_size: 64   # resolution of foveal crop fed to encoder
+  peripheral_output_size: 64  # resolution of blurred peripheral view
+  peripheral_blur_sigma: 8.0  # Gaussian blur sigma for periphery
+  num_fixations: 4        # saccades per image
+
+# Saccade policies to test (ordered from most naive to most intelligent)
+saccade_policies:
+  # --- Content-agnostic (don't look at the image) ---
+  - name: random
+    description: >
+      Uniformly random fixations. Null model — no spatial structure,
+      no content awareness. The fovea lands on uninformative regions
+      as often as informative ones.
+
+  - name: center_bias
+    description: >
+      Center-biased Gaussian fixations. Captures the human prior
+      (photographer bias places subjects near center), but doesn't
+      adapt to image content.
+
+  - name: scanpath
+    description: >
+      Sequential scanpath with realistic saccade amplitudes (exponential
+      distribution). Spatially correlated fixations, but still content-blind.
+
+  # --- Content-driven (adapt fixations to the specific image) ---
+  - name: saliency
+    description: >
+      Bottom-up saliency: fixate on high-contrast, high-gradient regions.
+      Approximates Itti-Koch saliency using local contrast + color variance +
+      center bias. Includes inhibition-of-return (IOR) so the model doesn't
+      refixate the same spot. This is the "what catches your eye" policy.
+
+  - name: object_center
+    description: >
+      Foreground-biased: fixate on regions that differ from the image border
+      (background prior). Approximates the human tendency to look at objects
+      rather than background/sky/ground. Uses border-contrast heuristic with
+      Gaussian smoothing for blob detection + IOR.
+
+  - name: information_gain
+    description: >
+      Active inference: fixate where the gap between peripheral and foveal
+      information is largest. Computes detail_loss (|sharp - blurry|) weighted
+      by local entropy of the peripheral view. This approximates expected free
+      energy minimization — look where looking would reduce the most uncertainty.
+
+  # --- Learned (uses a pretrained model's internal representations) ---
+  - name: attention_map
+    description: >
+      Use a pretrained ViT's CLS-token attention map from the last layer
+      as a saccade targeting signal. The CLS token attention tells you
+      "which patches does this model consider most task-relevant." This is
+      the closest analog to the superior colliculus receiving cortical
+      feedback (from FEF / prefrontal) to plan eye movements.
+      Supports configurable: model_name, layer_index, head_reduction
+      (mean/max), and temperature (exploration vs exploitation).
+
+graph:
+  encoder_name: vit_small_patch16_224
+  latent_dim: 384
+  predictor_hidden_dim: 512
+  predictor_layers: 2
+  include_feedback: false
+
+data:
+  dataset: cifar100
+  root: ./data
+  batch_size: 64  # smaller batches due to multiple fixations per sample
+  num_workers: 4
+
+training:
+  steps_per_stage: 10000
+  saccade_prediction_steps: 15000
+  lr: 1e-4
+  weight_decay: 0.05
+  log_every: 100
+  checkpoint_dir: ./checkpoints/exp9
+
+eval:
+  probe_epochs: 50
+  num_classes: 100
+  metrics:
+    # Core question: does accuracy improve with more fixations?
+    - integration_vs_num_fixations
+
+    # Specialization: peripheral=gist, foveal=detail
+    - per_node_probe_accuracy
+    - foveal_vs_peripheral_on_fine_grained  # fine-grained classes
+    - foveal_vs_peripheral_on_coarse        # superclass-level
+
+    # Saccade prediction quality
+    - where_next_prediction_loss
+    - does_saccade_policy_affect_integration
+
+    # Combined representation
+    - foveal_plus_peripheral_vs_each_alone
+
+# Key predictions:
+#
+# 1. Integration accuracy increases with fixations (more saccades = more info)
+#    This would show the graph learns to accumulate across eye movements.
+#
+# 2. Peripheral node better at coarse/superclass classification;
+#    foveal node better at fine-grained (subordinate) classification.
+#    This mirrors the known gist/detail dissociation.
+#
+# 3. Where_Next node successfully predicts next foveal latent.
+#    This is the saccade planning / predictive coding result:
+#    the brain anticipates what it will see at the next fixation.
+#
+# 4. Content-driven policies >> content-agnostic:
+#    information_gain ≥ saliency > object_center > scanpath > center_bias > random
+#    Intelligent targeting of the fovea is critical — a saccade to background
+#    is a wasted fixation. This is why saccade planning is one of the most
+#    heavily optimized systems in the primate brain.
+#
+# 5. Combined foveal+peripheral should beat either alone,
+#    but the integration node should beat naive concatenation
+#    (because it learned to combine them through the prediction objective).
+#
+# 6. Saccade prediction (Where_Next) should be harder for content-driven
+#    policies than random (because the targets are image-dependent), but the
+#    learned predictions should be more useful (pointing at informative regions).

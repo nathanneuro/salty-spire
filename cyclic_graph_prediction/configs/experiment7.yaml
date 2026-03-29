@@ -1,0 +1,102 @@
+# Experiment 7: Ventral/Dorsal stream specialization
+#
+# Central question: does graph topology alone cause the ventral stream
+# (V2->V4->IT) to specialize for object identity and the dorsal stream
+# (MT->MST->Parietal) for motion, without any explicit functional objective?
+#
+# Graph topology (mimics macaque visual cortex):
+#
+#   V1(0) ──→ V2(1) ──→ V4(2) ──→ IT(3)        [ventral: "what"]
+#     │                   ↕
+#     └────→ MT(4) ──→ MST(5) ──→ Parietal(6)   [dorsal: "where/how"]
+#
+# All nodes have identical architecture and receive the same input
+# (frame pairs). The only asymmetry is their position in the graph.
+
+experiment: ventral_dorsal_streams
+
+graph:
+  encoder_name: vit_small_patch16_224
+  latent_dim: 384
+  predictor_hidden_dim: 512
+  predictor_layers: 2
+  include_cross_stream: true   # V4 ↔ MT bridge
+  include_feedback: false      # feedforward-only for clean test
+
+# Input strategy
+input:
+  # "both_frames": all nodes see [frame1, frame2] concatenated (6 channels)
+  #   → the STRONGEST test: specialization must emerge from topology alone
+  # "per_stream": ventral sees frame1, dorsal sees frame_diff
+  #   → explicitly biased control condition
+  strategy: both_frames
+  in_chans: 6  # two 3-channel frames concatenated
+
+data:
+  dataset: cifar100
+  root: ./data
+  image_size: 224
+  transform_magnitude: 0.15  # strength of synthetic motion transforms
+  batch_size: 128
+  num_workers: 4
+
+# Cascade training stages (sequential, like cortical development)
+stages:
+  steps_per_stage: 10000
+  feedback_steps: 5000
+  # Order: V1 → (V2, MT) → (V4, MST) → (IT, Parietal)
+
+training:
+  lr: 1e-4
+  weight_decay: 0.05
+  log_every: 100
+  checkpoint_dir: ./checkpoints/exp7
+
+eval:
+  probe_epochs: 50
+  # Identity probe: classify object category → ventral should win
+  num_identity_classes: 100  # CIFAR-100
+  # Motion probe: classify transform type → dorsal should win
+  num_motion_classes: 8  # from temporal.py TRANSFORMS catalog
+
+  # The critical metric: double dissociation
+  # ventral_identity_acc > dorsal_identity_acc AND
+  # dorsal_motion_acc > ventral_motion_acc
+  # → topology-driven specialization is real
+
+# Ablations
+ablations:
+  # Control 1: Does specialization disappear without the V4↔MT bridge?
+  - name: no_cross_stream
+    include_cross_stream: false
+    description: >
+      Remove V4↔MT bridge. Without cross-stream interaction, the streams
+      are completely independent chains from V1. Specialization should
+      still occur if it's driven by chain position, or weaken if cross-stream
+      competition is necessary.
+
+  # Control 2: Biased input (explicitly gives dorsal stream motion signal)
+  - name: per_stream_input
+    input_strategy: per_stream
+    description: >
+      Give ventral nodes frame1 only, dorsal nodes frame1+frame_diff.
+      This SHOULD produce strong specialization since the input is biased.
+      Comparison with "both_frames" reveals how much specialization comes
+      from input vs. topology.
+
+  # Control 3: Scrambled topology (random graph, not ventral/dorsal)
+  - name: scrambled_topology
+    description: >
+      Same 7 nodes but randomly rewired edges (preserving degree distribution).
+      If specialization is topology-specific, it should disappear here.
+
+  # Control 4: Single chain (no branching — like Experiment 6)
+  - name: single_chain
+    description: >
+      V1 → V2 → V4 → IT → MT → MST → Parietal (linear chain).
+      No branching. Tests whether the branching structure is necessary
+      for stream specialization or if chain position is sufficient.
+
+  # Deeper test: which node in the hierarchy shows strongest specialization?
+  # Prediction: specialization should increase along each stream
+  # (IT most identity-selective, Parietal most motion-selective).
