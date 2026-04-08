@@ -1,26 +1,45 @@
-"""Wrappers for individual Monet experts to provide a uniform interface
-for tracing, quantization, and conversion."""
+"""Wrappers for individual Monet half-experts to provide a uniform interface
+for tracing, quantization, and conversion.
 
-from dataclasses import dataclass, field
-from typing import Optional
+Monet's product-key decomposition means each layer has 2N half-experts
+(N = 512 per product-key axis in the released checkpoints), not N^2
+effective experts. Conversion operates at the half-expert granularity:
+each half-expert is a small independent function of a slice of the
+residual stream (VD) and is converted to its own logic circuit.
+Effective-expert outputs are formed by composing half-experts according
+to the decomposition rule (additive sum over axes for VD).
+
+See docs/model_selection.md for the rationale.
+"""
+
+from dataclasses import dataclass
+from typing import Literal, Optional
 
 import torch
 import torch.nn as nn
 import numpy as np
 
 
+# Axis identifies which of the two product-key dimensions a half-expert
+# lives on. For VD these correspond to the left and right input slices;
+# for HD they correspond to the bottom and top compositional halves.
+Axis = Literal[0, 1]
+
+
 @dataclass
-class ExpertStats:
-    """Per-expert statistics collected during analysis."""
+class HalfExpertStats:
+    """Per-half-expert statistics collected during analysis."""
 
     layer_idx: int = 0
-    expert_idx: int = 0
+    axis: Axis = 0
+    half_expert_idx: int = 0  # 0..N-1 along the given axis
     name: str = ""
 
-    # Activation frequency (fraction of tokens routed to this expert)
+    # Activation frequency (fraction of tokens routed to this half-expert
+    # by the corresponding product-key router).
     activation_frequency: float = 0.0
 
-    # Input distribution
+    # Input distribution (over the slice this half-expert actually sees).
     input_mean: Optional[np.ndarray] = None
     input_var: Optional[np.ndarray] = None
     input_effective_rank: float = 0.0
@@ -30,30 +49,41 @@ class ExpertStats:
     output_var: Optional[np.ndarray] = None
 
     # Quantization diagnostics
-    reconstruction_error: float = 0.0  # vs float expert
-    effective_output_cardinality: int = 0  # distinct outputs on calibration set
+    reconstruction_error: float = 0.0       # vs float half-expert
+    effective_output_cardinality: int = 0   # distinct outputs on calibration set
 
     # Cluster assignment
     cluster_id: int = -1
 
 
-class ExpertWrapper(nn.Module):
-    """Wraps a single Monet expert FFN for uniform I/O tracing and replacement.
+class HalfExpertWrapper(nn.Module):
+    """Wraps a single Monet half-expert for uniform I/O tracing and replacement.
 
     Provides hooks to intercept inputs/outputs for calibration trace collection,
     and a replacement interface for swapping in quantized or circuit-based
-    implementations.
+    implementations. A half-expert is identified by the triple
+    (layer_idx, axis, half_expert_idx).
     """
 
-    def __init__(self, expert_module: nn.Module, layer_idx: int, expert_idx: int):
+    def __init__(
+        self,
+        half_expert_module: nn.Module,
+        layer_idx: int,
+        axis: Axis,
+        half_expert_idx: int,
+    ):
         super().__init__()
-        self.expert = expert_module
+        self.half_expert = half_expert_module
         self.layer_idx = layer_idx
-        self.expert_idx = expert_idx
-        self.name = f"layer{layer_idx}_expert{expert_idx}"
+        self.axis = axis
+        self.half_expert_idx = half_expert_idx
+        self.name = f"layer{layer_idx}_axis{axis}_he{half_expert_idx}"
 
-        self.stats = ExpertStats(
-            layer_idx=layer_idx, expert_idx=expert_idx, name=self.name
+        self.stats = HalfExpertStats(
+            layer_idx=layer_idx,
+            axis=axis,
+            half_expert_idx=half_expert_idx,
+            name=self.name,
         )
 
         # Trace buffers (populated during calibration)
@@ -65,7 +95,7 @@ class ExpertWrapper(nn.Module):
         if self._collecting_traces:
             self._input_traces.append(x.detach().cpu())
 
-        out = self.expert(x)
+        out = self.half_expert(x)
 
         if self._collecting_traces:
             self._output_traces.append(out.detach().cpu())
@@ -125,7 +155,7 @@ class ExpertWrapper(nn.Module):
         """Count effectively distinct output patterns.
 
         Quantizes outputs to a grid defined by tolerance, then counts unique
-        patterns. Low cardinality means the expert has collapsed to few modes.
+        patterns. Low cardinality means the half-expert has collapsed to few modes.
         """
         flat = outputs.reshape(-1, outputs.shape[-1]).float()
         # Discretize to tolerance grid
@@ -137,52 +167,64 @@ class ExpertWrapper(nn.Module):
         return cardinality
 
 
-class ExpertPopulation:
-    """Manages the full set of experts across all layers."""
+class HalfExpertPopulation:
+    """Manages the full set of half-experts across all layers and both axes."""
 
-    def __init__(self, experts: list[ExpertWrapper]):
-        self.experts = experts
-        self._by_name = {e.name: e for e in experts}
+    def __init__(self, half_experts: list[HalfExpertWrapper]):
+        self.half_experts = half_experts
+        self._by_name = {h.name: h for h in half_experts}
 
     def __len__(self) -> int:
-        return len(self.experts)
+        return len(self.half_experts)
 
     def __getitem__(self, key):
         if isinstance(key, str):
             return self._by_name[key]
-        return self.experts[key]
+        return self.half_experts[key]
 
     def __iter__(self):
-        return iter(self.experts)
+        return iter(self.half_experts)
 
-    def get_layer(self, layer_idx: int) -> list[ExpertWrapper]:
-        return [e for e in self.experts if e.layer_idx == layer_idx]
+    def get_layer(self, layer_idx: int) -> list[HalfExpertWrapper]:
+        return [h for h in self.half_experts if h.layer_idx == layer_idx]
 
-    def sort_by_reconstruction_error(self, ascending: bool = True) -> list[ExpertWrapper]:
+    def get_axis(self, layer_idx: int, axis: Axis) -> list[HalfExpertWrapper]:
+        return [
+            h for h in self.half_experts
+            if h.layer_idx == layer_idx and h.axis == axis
+        ]
+
+    def sort_by_reconstruction_error(self, ascending: bool = True) -> list[HalfExpertWrapper]:
         return sorted(
-            self.experts,
-            key=lambda e: e.stats.reconstruction_error,
+            self.half_experts,
+            key=lambda h: h.stats.reconstruction_error,
             reverse=not ascending,
         )
 
-    def sort_by_activation_frequency(self, ascending: bool = False) -> list[ExpertWrapper]:
+    def sort_by_activation_frequency(self, ascending: bool = False) -> list[HalfExpertWrapper]:
         return sorted(
-            self.experts,
-            key=lambda e: e.stats.activation_frequency,
+            self.half_experts,
+            key=lambda h: h.stats.activation_frequency,
             reverse=not ascending,
         )
 
     def get_stats_summary(self) -> dict:
-        """Return summary statistics across the expert population."""
-        errors = [e.stats.reconstruction_error for e in self.experts]
-        freqs = [e.stats.activation_frequency for e in self.experts]
+        """Return summary statistics across the half-expert population."""
+        errors = [h.stats.reconstruction_error for h in self.half_experts]
+        freqs = [h.stats.activation_frequency for h in self.half_experts]
         cards = [
-            e.stats.effective_output_cardinality
-            for e in self.experts
-            if e.stats.effective_output_cardinality > 0
+            h.stats.effective_output_cardinality
+            for h in self.half_experts
+            if h.stats.effective_output_cardinality > 0
         ]
+        layer_axis_counts: dict[tuple[int, int], int] = {}
+        for h in self.half_experts:
+            key = (h.layer_idx, int(h.axis))
+            layer_axis_counts[key] = layer_axis_counts.get(key, 0) + 1
+
         return {
-            "num_experts": len(self.experts),
+            "num_half_experts": len(self.half_experts),
+            "num_layer_axis_groups": len(layer_axis_counts),
             "reconstruction_error": {
                 "mean": float(np.mean(errors)) if errors else 0,
                 "std": float(np.std(errors)) if errors else 0,

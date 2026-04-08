@@ -1,34 +1,45 @@
-"""Hybrid Monet model with logic-circuit experts replacing float experts.
+"""Hybrid Monet model with logic-circuit half-experts replacing float half-experts.
 
-Used in Steps 3c and 3d: the router and attention remain in float,
-while experts dispatch to either logic-circuit implementations or
-quantized-float fallbacks.
+Used in Steps 3c and 3d: routers and attention remain in float, while each
+half-expert slot is backed by either a LogicCircuitHalfExpert or the original
+quantized-float half-expert, decided per-half-expert based on conversion
+quality. Effective-expert outputs are formed by composing half-experts
+according to the decomposition rule (VD: additive over axes).
 """
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Literal, Optional
 
 import torch
 import torch.nn as nn
 
 
+Axis = Literal[0, 1]
+
+
 @dataclass
-class ExpertImplementation:
-    """Tracks which implementation backs each expert slot."""
+class HalfExpertImplementation:
+    """Tracks which implementation backs each half-expert slot."""
 
     layer_idx: int
-    expert_idx: int
+    axis: Axis
+    half_expert_idx: int
     method: str  # "exact_circuit", "learned_circuit", "quantized_float"
     circuit_size: int = 0  # Number of gates (0 for float fallback)
     reconstruction_error: float = 0.0
 
+    @property
+    def name(self) -> str:
+        return f"layer{self.layer_idx}_axis{self.axis}_he{self.half_expert_idx}"
+
 
 class InputBinarizer(nn.Module):
-    """Binarizes the residual stream input to expert circuits.
+    """Binarizes the residual-stream slice feeding a half-expert circuit.
 
     Supports strict binary (sign), stochastic binarization, and learned
     per-channel thresholds. Multi-bit mode quantizes to n bits instead
-    of strict binary.
+    of strict binary. For VD, ``hidden_dim`` is the size of the disjoint
+    input slice that this half-expert actually sees, not the full residual.
     """
 
     def __init__(self, hidden_dim: int, method: str = "sign", bits: int = 1):
@@ -59,10 +70,8 @@ class InputBinarizer(nn.Module):
                 return (x > self.threshold).float() * 2 - 1
         else:
             # Multi-bit quantization
-            # x: (..., hidden_dim), boundaries: (hidden_dim, 2^bits - 1)
             expanded = x.unsqueeze(-1)  # (..., hidden_dim, 1)
             level = (expanded > self.boundaries).sum(dim=-1).float()
-            # Normalize to [-1, 1]
             max_level = 2**self.bits - 1
             return level / max_level * 2 - 1
 
@@ -70,26 +79,27 @@ class InputBinarizer(nn.Module):
 
 
 class OutputDecoder(nn.Module):
-    """Per-expert small MLP that decodes circuit bit-outputs back to float."""
+    """Per-half-expert small MLP that decodes circuit bit-outputs back to float."""
 
-    def __init__(self, circuit_output_dim: int, hidden_dim: int, decoder_hidden: int = 64):
+    def __init__(self, circuit_output_dim: int, output_dim: int, decoder_hidden: int = 64):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(circuit_output_dim, decoder_hidden),
             nn.GELU(),
-            nn.Linear(decoder_hidden, hidden_dim),
+            nn.Linear(decoder_hidden, output_dim),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.net(x)
 
 
-class LogicCircuitExpert(nn.Module):
+class LogicCircuitHalfExpert(nn.Module):
     """Wraps a compiled logic circuit as a PyTorch module for inference.
 
     The circuit itself is a bit-operation graph evaluated via integer
-    tensor ops. This module handles binarization of input, circuit
-    evaluation, and decoding of output.
+    tensor ops. This module handles binarization of the half-expert's
+    input slice, circuit evaluation, and decoding of the output back to
+    the float subspace that the effective-expert composition expects.
     """
 
     def __init__(
@@ -110,30 +120,32 @@ class LogicCircuitExpert(nn.Module):
 
 
 class HybridMonetModel(nn.Module):
-    """Full Monet model with per-expert implementation dispatch.
+    """Full Monet model with per-half-expert implementation dispatch.
 
-    Router and attention run in float. Each expert slot is backed by
-    either a LogicCircuitExpert or the original quantized-float expert,
-    decided per-expert based on conversion quality.
+    Routers and attention run in float. Each half-expert slot is backed by
+    either a LogicCircuitHalfExpert or the original quantized-float
+    half-expert, decided per-half-expert based on conversion quality.
+    Effective-expert outputs are recovered by composing half-expert outputs
+    under the decomposition rule (VD: sum over axes).
     """
 
     def __init__(
         self,
         base_model: nn.Module,
-        expert_impls: dict[str, nn.Module],
-        impl_metadata: list[ExpertImplementation],
+        half_expert_impls: dict[str, nn.Module],
+        impl_metadata: list[HalfExpertImplementation],
     ):
         super().__init__()
         self.base_model = base_model
-        self.expert_impls = nn.ModuleDict(expert_impls)
+        self.half_expert_impls = nn.ModuleDict(half_expert_impls)
         self.impl_metadata = impl_metadata
 
     def get_conversion_stats(self) -> dict:
-        """Report conversion method breakdown."""
+        """Report conversion method breakdown at the half-expert granularity."""
         methods = [m.method for m in self.impl_metadata]
         total = len(methods)
         return {
-            "total_experts": total,
+            "total_half_experts": total,
             "exact_circuit": methods.count("exact_circuit"),
             "learned_circuit": methods.count("learned_circuit"),
             "quantized_float": methods.count("quantized_float"),
@@ -149,17 +161,43 @@ class HybridMonetModel(nn.Module):
         """Forward pass through the hybrid model.
 
         The actual dispatch happens inside the MoE layer, which has been
-        patched to use self.expert_impls instead of the original experts.
-        This forward just calls the base model, which has been monkey-patched.
+        patched to use ``self.half_expert_impls`` instead of the original
+        half-experts. This forward just calls the base model.
         """
         return self.base_model(*args, **kwargs)
+
+
+def _parse_half_expert_name(name: str) -> tuple[int, Axis, int]:
+    """Parse a half-expert name of the form 'layerL_axisA_heH' into components.
+
+    Raises ValueError if the name does not match the expected format. This
+    format is the canonical one produced by HalfExpertWrapper.
+    """
+    # e.g. "layer3_axis0_he17"
+    try:
+        layer_part, axis_part, he_part = name.split("_", 2)
+        assert layer_part.startswith("layer")
+        assert axis_part.startswith("axis")
+        assert he_part.startswith("he")
+        layer_idx = int(layer_part[len("layer"):])
+        axis = int(axis_part[len("axis"):])
+        half_expert_idx = int(he_part[len("he"):])
+    except (ValueError, AssertionError) as e:
+        raise ValueError(
+            f"Half-expert name {name!r} does not match "
+            f"'layerL_axisA_heH' format"
+        ) from e
+    if axis not in (0, 1):
+        raise ValueError(f"Half-expert axis must be 0 or 1, got {axis}")
+    return layer_idx, axis, half_expert_idx  # type: ignore[return-value]
 
 
 def build_hybrid_model(
     base_model: nn.Module,
     circuits: dict[str, object],
     quantized_fallbacks: dict[str, nn.Module],
-    hidden_dim: int,
+    half_expert_input_dim: int,
+    half_expert_output_dim: int,
     binarizer_config: dict,
     decoder_hidden: int = 64,
 ) -> HybridMonetModel:
@@ -167,52 +205,54 @@ def build_hybrid_model(
 
     Args:
         base_model: Original Monet model (will be modified in place).
-        circuits: Dict mapping expert name -> compiled circuit object.
-        quantized_fallbacks: Dict mapping expert name -> quantized float expert.
-        hidden_dim: Model hidden dimension.
+        circuits: Dict mapping half-expert name -> compiled circuit object.
+        quantized_fallbacks: Dict mapping half-expert name -> quantized float half-expert.
+        half_expert_input_dim: Size of the input slice each half-expert sees.
+        half_expert_output_dim: Size of a half-expert's output (d_expert for VD).
         binarizer_config: Config for InputBinarizer (method, bits).
         decoder_hidden: Hidden dim for output decoders.
 
     Returns:
-        HybridMonetModel with per-expert dispatch.
+        HybridMonetModel with per-half-expert dispatch.
     """
-    expert_impls = {}
-    metadata = []
+    half_expert_impls: dict[str, nn.Module] = {}
+    metadata: list[HalfExpertImplementation] = []
 
-    all_expert_names = set(circuits.keys()) | set(quantized_fallbacks.keys())
+    all_names = set(circuits.keys()) | set(quantized_fallbacks.keys())
 
-    for name in sorted(all_expert_names):
-        parts = name.replace("layer", "").replace("expert", "").split("_")
-        layer_idx = int(parts[0]) if len(parts) >= 1 else 0
-        expert_idx = int(parts[1]) if len(parts) >= 2 else 0
+    for name in sorted(all_names):
+        layer_idx, axis, half_expert_idx = _parse_half_expert_name(name)
 
         if name in circuits:
             circuit = circuits[name]
             binarizer = InputBinarizer(
-                hidden_dim,
+                half_expert_input_dim,
                 method=binarizer_config.get("method", "sign"),
                 bits=binarizer_config.get("bits", 1),
             )
-            circuit_output_dim = getattr(circuit, "output_dim", hidden_dim)
-            decoder = OutputDecoder(circuit_output_dim, hidden_dim, decoder_hidden)
-            impl = LogicCircuitExpert(circuit, binarizer, decoder)
-            expert_impls[name] = impl
+            circuit_output_dim = getattr(circuit, "output_dim", half_expert_output_dim)
+            decoder = OutputDecoder(
+                circuit_output_dim, half_expert_output_dim, decoder_hidden
+            )
+            impl: nn.Module = LogicCircuitHalfExpert(circuit, binarizer, decoder)
+            half_expert_impls[name] = impl
 
-            method = "exact_circuit"  # Could check circuit provenance
-            meta = ExpertImplementation(
+            meta = HalfExpertImplementation(
                 layer_idx=layer_idx,
-                expert_idx=expert_idx,
-                method=method,
+                axis=axis,
+                half_expert_idx=half_expert_idx,
+                method="exact_circuit",  # Could check circuit provenance
                 circuit_size=getattr(circuit, "num_gates", 0),
             )
         else:
-            expert_impls[name] = quantized_fallbacks[name]
-            meta = ExpertImplementation(
+            half_expert_impls[name] = quantized_fallbacks[name]
+            meta = HalfExpertImplementation(
                 layer_idx=layer_idx,
-                expert_idx=expert_idx,
+                axis=axis,
+                half_expert_idx=half_expert_idx,
                 method="quantized_float",
             )
 
         metadata.append(meta)
 
-    return HybridMonetModel(base_model, expert_impls, metadata)
+    return HybridMonetModel(base_model, half_expert_impls, metadata)

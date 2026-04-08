@@ -1,7 +1,9 @@
-"""Storage and retrieval of per-expert (input, output) trace pairs.
+"""Storage and retrieval of per-half-expert (input, output) trace pairs.
 
 Traces are the reference data for every distillation and verification step.
-Collected once in Step 0 on the calibration set, reused in all subsequent steps.
+Collected once in Step 0 on the calibration set, reused in all subsequent
+steps. Keyed by half-expert name (e.g. 'layer3_axis0_he17'); the store
+itself is generic over the key string.
 """
 
 from pathlib import Path

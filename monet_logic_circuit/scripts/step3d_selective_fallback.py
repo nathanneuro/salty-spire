@@ -1,6 +1,6 @@
 """Step 3d: Selective fallback for the long tail.
 
-Experts that couldn't be converted cleanly stay as quantized float.
+Half-experts that couldn't be converted cleanly stay as quantized float.
 Measures the final hybrid model with honest speedup numbers.
 
 Usage:
@@ -25,6 +25,12 @@ from monet_logic_circuit.eval.downstream import (
     format_results_table,
 )
 from monet_logic_circuit.eval.profiling import profile_model
+from monet_logic_circuit.pipeline.signals import (
+    DecisionSignal,
+    OUTCOME_FAIL,
+    OUTCOME_PASS,
+    write_signal_into_results,
+)
 
 
 def main():
@@ -54,26 +60,29 @@ def main():
     model, model_config = load_monet_model(
         config["model"]["base_checkpoint"],
         device=config["model"]["device"],
+        allowed_decompositions=config["model"].get("allowed_decompositions"),
     )
     tokenizer = _load_tokenizer(config["model"]["base_checkpoint"])
     device = next(model.parameters()).device
 
-    # Classify experts into circuit vs fallback
+    # Classify half-experts into circuit vs fallback
     threshold = config["fallback"]["reconstruction_error_threshold"]
-    force_quantized = set(config["fallback"].get("force_quantized_experts", []))
+    force_quantized = set(
+        config["fallback"].get("force_quantized_half_experts", [])
+    )
 
     circuits = {}
     quantized_fallbacks = {}
-    per_expert_stats = []
+    per_half_expert_stats = []
 
-    decisions = conversion_results.get("per_expert_decisions", {})
+    decisions = conversion_results.get("per_half_expert_decisions", {})
     for name, decision in decisions.items():
         recon_error = decision.get("reconstruction_error", 0)
 
         if name in force_quantized or recon_error > threshold:
             # Fallback to quantized float
             quantized_fallbacks[name] = None  # Would load actual module
-            per_expert_stats.append({
+            per_half_expert_stats.append({
                 "name": name,
                 "method": "quantized_float",
                 "reconstruction_error": recon_error,
@@ -81,19 +90,19 @@ def main():
             })
         else:
             circuits[name] = None  # Would load actual circuit
-            per_expert_stats.append({
+            per_half_expert_stats.append({
                 "name": name,
                 "method": decision.get("method", "learned"),
                 "reconstruction_error": recon_error,
                 "gates": decision.get("gates", 0),
             })
 
-    total = len(per_expert_stats)
-    n_circuit = sum(1 for s in per_expert_stats if s["method"] != "quantized_float")
+    total = len(per_half_expert_stats)
+    n_circuit = sum(1 for s in per_half_expert_stats if s["method"] != "quantized_float")
     n_fallback = total - n_circuit
     fallback_frac = n_fallback / total if total > 0 else 0
 
-    print(f"\nExpert conversion breakdown:")
+    print(f"\nHalf-expert conversion breakdown:")
     print(f"  Logic circuits: {n_circuit}/{total} ({n_circuit/total*100:.1f}%)")
     print(f"  Quantized fallback: {n_fallback}/{total} ({fallback_frac*100:.1f}%)")
 
@@ -111,7 +120,8 @@ def main():
         base_model=model,
         circuits=circuits,
         quantized_fallbacks=quantized_fallbacks,
-        hidden_dim=model_config.hidden_dim,
+        half_expert_input_dim=model_config.hidden_dim // 2,
+        half_expert_output_dim=model_config.expert_dim,
         binarizer_config={"method": "sign", "bits": 1},
     )
 
@@ -163,14 +173,14 @@ def main():
 
     # Conversion statistics
     results["conversion_stats"] = {
-        "total_experts": total,
-        "exact_circuit": sum(1 for s in per_expert_stats if s["method"] == "exact"),
-        "learned_circuit": sum(1 for s in per_expert_stats if s["method"] == "learned"),
+        "total_half_experts": total,
+        "exact_circuit": sum(1 for s in per_half_expert_stats if s["method"] == "exact"),
+        "learned_circuit": sum(1 for s in per_half_expert_stats if s["method"] == "learned"),
         "quantized_float": n_fallback,
         "circuit_fraction": n_circuit / total if total > 0 else 0,
         "fallback_fraction": fallback_frac,
     }
-    results["per_expert_stats"] = per_expert_stats
+    results["per_half_expert_stats"] = per_half_expert_stats
 
     # Final verdict
     print("\n" + "=" * 60)
@@ -181,7 +191,8 @@ def main():
     print(f"  Circuit coverage: {n_circuit/total*100:.1f}%")
 
     within_quality = abs(ppl_delta) < 0.1  # ~1-2% quality
-    good_speedup = results.get("speedup_vs_baseline", 0) >= 10
+    speedup = float(results.get("speedup_vs_baseline", 0.0))
+    good_speedup = speedup >= 10
     if within_quality and good_speedup:
         print("\n  VERDICT: Within target regime (1-2% quality, 10x+ speed)")
         print("  Proceed to scaling and write-up.")
@@ -191,9 +202,26 @@ def main():
         print("\n  VERDICT: Quality loss too high for the achieved speedup.")
         print("  See loss decomposition in Step 3c to identify dominant cost.")
 
-    # Save
+    # Canonical decision signal for the orchestrator. This step's metrics
+    # are also what the pipeline's final_verdict gates evaluate against.
+    signal_metrics = {
+        "perplexity_delta_nats": float(ppl_delta),
+        "speedup_vs_baseline": speedup,
+        "fallback_fraction": float(fallback_frac),
+        "circuit_fraction": float(n_circuit / total) if total else 0.0,
+    }
+    signal = DecisionSignal(
+        step="3d",
+        outcome=OUTCOME_PASS if (within_quality and good_speedup) else OUTCOME_FAIL,
+        metrics=signal_metrics,
+        reason=(
+            f"ppl_delta={ppl_delta:+.4f}, speedup={speedup:.1f}x, "
+            f"fallback={fallback_frac:.1%}"
+        ),
+    )
+    results_out = write_signal_into_results(dict(results), signal)
     with open(output_dir / "results.json", "w") as f:
-        json.dump(results, f, indent=2, default=str)
+        json.dump(results_out, f, indent=2, default=str)
 
     print(f"\nAll results saved to {output_dir}")
 

@@ -2,8 +2,9 @@ experiment: step0_baseline
 
 model:
   name: monet
-  checkpoint: null  # Set to path or HF hub ID of pretrained Monet checkpoint
+  checkpoint: MonetLLM/monet-vd-850M-100BT-hf  # Primary dev target; see docs/model_selection.md
   device: auto      # auto, cpu, cuda, cuda:0, etc.
+  allowed_decompositions: [vd]  # HD variants deferred to late-stage comparison only
 
 data:
   calibration:
@@ -41,16 +42,17 @@ profiling:
 
 expert_analysis:
   enabled: true
-  activation_frequency: true     # How often router selects each expert
-  input_statistics: true         # Mean, variance, effective rank per expert
-  output_statistics: true        # Mean, variance per expert output
-  clustering: true               # Cluster experts by feature similarity
+  granularity: half_expert       # Convert at the 2N=1024 half-expert level, not N^2 effective experts
+  activation_frequency: true     # How often router selects each half-expert
+  input_statistics: true         # Mean, variance, effective rank per half-expert
+  output_statistics: true        # Mean, variance per half-expert output
+  clustering: true               # Cluster half-experts by feature similarity
   num_clusters: auto             # Auto-select via elbow method
 
 traces:
   save: true
   output_dir: outputs/step0/traces
-  format: safetensors  # Per-expert (input, output) pairs on calibration set
+  format: safetensors  # Per-half-expert (input, output) pairs on calibration set
 
 outputs:
   dir: outputs/step0

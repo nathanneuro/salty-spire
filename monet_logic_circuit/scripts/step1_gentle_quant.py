@@ -27,7 +27,13 @@ from monet_logic_circuit.eval.downstream import (
 from monet_logic_circuit.eval.profiling import profile_model
 from monet_logic_circuit.quantization.gentle import (
     apply_gentle_quantization,
-    measure_per_expert_reconstruction,
+    measure_per_half_expert_reconstruction,
+)
+from monet_logic_circuit.pipeline.signals import (
+    DecisionSignal,
+    OUTCOME_FAIL,
+    OUTCOME_PASS,
+    write_signal_into_results,
 )
 
 
@@ -52,6 +58,7 @@ def main():
     model, model_config = load_monet_model(
         config["model"]["checkpoint"],
         device=config["model"]["device"],
+        allowed_decompositions=config["model"].get("allowed_decompositions"),
     )
     tokenizer = _load_tokenizer(config["model"]["checkpoint"])
     device = next(model.parameters()).device
@@ -116,12 +123,14 @@ def main():
             results["downstream_delta"] = deltas
             print(format_results_table(downstream, baseline_results.get("downstream")))
 
-    # Per-expert reconstruction error
+    # Per-half-expert reconstruction error
     if config["expert_analysis"]["per_expert_reconstruction_error"]:
-        print("Measuring per-expert reconstruction error...")
+        print("Measuring per-half-expert reconstruction error...")
         trace_store = ExpertTraceStore(baseline_dir / "traces")
-        errors = measure_per_expert_reconstruction(model, quantized_model, trace_store)
-        results["per_expert_reconstruction_error"] = errors
+        errors = measure_per_half_expert_reconstruction(
+            model, quantized_model, trace_store
+        )
+        results["per_half_expert_reconstruction_error"] = errors
         if errors:
             import numpy as np
             err_vals = list(errors.values())
@@ -148,9 +157,19 @@ def main():
     else:
         print("\n  Go/no-go: PASS")
 
-    # Save
+    # Canonical decision signal for the pipeline orchestrator.
+    signal = DecisionSignal(
+        step="1",
+        outcome=OUTCOME_PASS if go_no_go["pass"] else OUTCOME_FAIL,
+        metrics={
+            "perplexity_delta_nats": float(go_no_go.get("ppl_delta", 0.0)),
+            "downstream_loss_pct": float(go_no_go.get("downstream_loss_pct", 0.0)),
+        },
+        reason=go_no_go.get("reason", ""),
+    )
+    results_out = write_signal_into_results(dict(results), signal)
     with open(output_dir / "results.json", "w") as f:
-        json.dump(results, f, indent=2, default=str)
+        json.dump(results_out, f, indent=2, default=str)
 
     print(f"\nResults saved to {output_dir}")
 

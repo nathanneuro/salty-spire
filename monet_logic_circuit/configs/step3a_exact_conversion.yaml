@@ -2,17 +2,22 @@ experiment: step3a_exact_conversion
 
 model:
   ternary_checkpoint: outputs/step2/ternary_model  # From Step 2
+  source_checkpoint: MonetLLM/monet-vd-850M-100BT-hf  # Architecture reference
   device: auto
+  allowed_decompositions: [vd]
 
 conversion:
-  method: aytekin  # Exact decision tree extraction for ternary networks
-  expert_subset:
-    num_experts: 100
-    selection: easy_first  # Pick experts with lowest reconstruction error from Step 2
+  method: aytekin        # Exact decision tree extraction for ternary networks
+  granularity: half_expert  # Convert the 2N=1024 half-experts per layer, compose afterwards
+  half_expert_subset:
+    num_half_experts: 200     # ~20% of a layer's 1024 half-experts for initial pass
+    selection: easy_first     # Pick half-experts with lowest reconstruction error from Step 2
     reconstruction_error_dir: outputs/step2
+    balance_axes: true        # Ensure both product-key axes are represented
 
   tree_extraction:
-    verify_exact: true  # Verify tree produces identical outputs to ternary expert
+    verify_exact: true  # Verify tree produces identical outputs to ternary half-expert
+    input_dim_source: half_expert_slice  # VD half-experts see disjoint dimension slices
 
   logic_minimization:
     tool: espresso  # espresso, abc, or both
@@ -27,17 +32,23 @@ conversion:
     check_all_calibration_inputs: true  # Verify exact equivalence on full calibration set
 
 expert_analysis:
+  granularity: half_expert
   use_step2_reconstruction_errors: true
   reconstruction_error_dir: outputs/step2
+
+composition:
+  # How converted half-experts are recombined to form effective-expert outputs
+  mode: vd_additive  # VD: sum of left-slice and right-slice half-expert outputs
+  verify_on_effective_experts: true  # Sanity-check composed output vs float effective expert
 
 outputs:
   dir: outputs/step3a
   save_trees: true
   save_circuits: true
-  save_size_distribution: true  # Gates per expert distribution
+  save_size_distribution: true  # Gates per half-expert distribution
 
 thresholds:
-  # Outcome-dependent routing to next step
-  small_circuit_max_gates: 10_000    # "Dream case" threshold
-  tractable_circuit_max_gates: 100_000  # "Tractable but large"
-  # If most experts exceed tractable, exact conversion has blown up
+  # Outcome-dependent routing to next step. Thresholds apply per half-expert.
+  small_circuit_max_gates: 10_000      # "Dream case" threshold
+  tractable_circuit_max_gates: 100_000 # "Tractable but large"
+  # If most half-experts exceed tractable, exact conversion has blown up.

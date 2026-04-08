@@ -1,0 +1,112 @@
+pipeline:
+  # All paths below are relative to the repo root (cwd when the orchestrator
+  # is invoked). results_root is where each step's results.json lives.
+  results_root: outputs
+
+  # --- Scale progression ---
+  # When scale_automatically: true, the orchestrator runs the full pipeline
+  # on each checkpoint in order, advancing only after the previous scale's
+  # final verdict passes. Derived checkpoints (ternary_checkpoint, circuits_dir,
+  # hybrid_model_dir) are NOT rewritten — they live under results_root and are
+  # expected to be rebuilt from scratch per scale.
+  scale_automatically: false
+  scale_progression:
+    - MonetLLM/monet-vd-850M-100BT-hf
+    - MonetLLM/monet-vd-1.4B-100BT-hf
+    - MonetLLM/monet-vd-4.1B-100BT-hf
+
+  # --- Steps ---
+  # Each step runs as a subprocess. After it finishes, the orchestrator
+  # loads `outputs/step{name}/results.json`, pulls the `decision_signal`
+  # block, evaluates the gates below, and either proceeds, branches, or
+  # halts. `on_fail: halt` stops the pipeline; `on_fail: warn` continues
+  # and records the failure in the trace.
+  steps:
+    - step: "0"
+      script: step0_baseline
+      config: monet_logic_circuit/configs/step0_baseline.yaml
+      always_run: true
+      # Step 0 has no gate; it just establishes the reference numbers.
+      note: "Baseline reference; never gated."
+
+    - step: "1"
+      script: step1_gentle_quant
+      config: monet_logic_circuit/configs/step1_gentle_quant.yaml
+      gates:
+        perplexity_delta_nats: { max: 0.1 }
+        downstream_loss_pct:   { max: 2.0 }
+      on_fail: halt
+      note: "8/4-bit should be near-free; a gate failure here means
+             Monet has unusual quantization sensitivity worth investigating."
+
+    - step: "2"
+      script: step2_aggressive_quant
+      config: monet_logic_circuit/configs/step2_aggressive_quant.yaml
+      gates:
+        perplexity_delta_nats:    { max: 0.5 }
+        downstream_loss_pct:      { max: 5.0 }
+        # If ternary collapse makes the mean output cardinality very low
+        # we're compressing into too few modes to recover quality; halt.
+        mean_output_cardinality:  { min: 4 }
+      on_fail: halt
+      note: "Ternary variant must be usable for Steps 3a/3b to make sense."
+
+    - step: "3a"
+      script: step3a_exact_conversion
+      config: monet_logic_circuit/configs/step3a_exact_conversion.yaml
+      # 3a branches on the qualitative outcome rather than numeric gates.
+      # Outcomes emitted by the step script:
+      #   dream_case - most half-experts have small circuits; skip 3b
+      #   tractable  - workable but large; the learned converter is worth it
+      #   blown_up   - exact conversion failed for most half-experts;
+      #                learned converter is now the main hope
+      branches:
+        dream_case: "3c"   # skip learned converter, go straight to end-to-end
+        tractable:  "3b"
+        blown_up:   "3b"
+      on_fail: halt
+      note: "Qualitative branching: dream_case skips 3b, blown_up still tries 3b."
+
+    - step: "3b"
+      script: step3b_learned_converter
+      config: monet_logic_circuit/configs/step3b_learned_converter.yaml
+      gates:
+        # Val reconstruction error per half-expert after converter training.
+        # 5% NMSE is roughly the ceiling for the selective-fallback step to
+        # recover a useful fraction of half-experts.
+        val_reconstruction_nmse: { max: 0.05 }
+      on_fail: halt
+      next: "3c"
+
+    - step: "3c"
+      script: step3c_end_to_end
+      config: monet_logic_circuit/configs/step3c_end_to_end.yaml
+      gates:
+        # End-to-end budget: we're willing to spend up to 0.15 nats on the
+        # full hybrid (quantization + conversion + interface), since 3d
+        # will recover some of this via selective fallback.
+        perplexity_delta_nats: { max: 0.15 }
+      on_fail: warn
+      next: "3d"
+      note: "Warn rather than halt: loss decomposition in 3c tells us
+             whether 3d fallback can recover quality."
+
+    - step: "3d"
+      script: step3d_selective_fallback
+      config: monet_logic_circuit/configs/step3d_selective_fallback.yaml
+      gates:
+        perplexity_delta_nats: { max: 0.1 }   # Final quality budget
+        speedup_vs_baseline:   { min: 10.0 }  # Final speed target
+        fallback_fraction:     { max: 0.30 }  # Warn threshold from step config
+      on_fail: warn
+      next: null
+      note: "Final step; verdict gates below also apply to its signal."
+
+  # --- Final verdict ---
+  # Applied to the signal of the last step that produced one. If these
+  # gates fail, the overall pipeline run is reported as failing even if
+  # no individual step halted. Kept in sync with Step 3d's numeric gates
+  # intentionally — this is the 'would we ship it?' check.
+  final_verdict:
+    perplexity_delta_nats: { max: 0.1 }
+    speedup_vs_baseline:   { min: 10.0 }

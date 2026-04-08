@@ -2,8 +2,9 @@ experiment: step2_aggressive_quant
 
 model:
   name: monet
-  checkpoint: null
+  checkpoint: MonetLLM/monet-vd-850M-100BT-hf
   device: auto
+  allowed_decompositions: [vd]
 
 baseline:
   reference_dir: outputs/step0
@@ -13,15 +14,15 @@ quantization:
   sweep:
     bits: [1, 1.58, 2]                              # 1-bit, ternary, 2-bit
     scope: [weights_only, weights_and_activations]    # What to quantize
-    scale_granularity: [per_tensor, per_channel, per_expert]  # Scale sharing
+    scale_granularity: [per_tensor, per_channel, per_half_expert]  # Scale sharing (half-expert level)
   targets:
     experts: true
     attention: false
     norms: false
     embeddings: false
   ternary:
-    values: [-1, 0, 1]       # BitNet-style ternary
-    scale_per_expert: true
+    values: [-1, 0, 1]            # BitNet-style ternary
+    scale_per_half_expert: true   # One scalar per half-expert (2N=1024 per layer)
 
 fine_tuning:
   enabled: true
@@ -34,7 +35,7 @@ fine_tuning:
   batch_size: 8
   gradient_accumulation: 4
   max_steps: 5000
-  freeze_non_expert: true  # Only update expert weights during QAT
+  freeze_non_expert: true  # Only update half-expert weights during QAT; routers/attention frozen
 
 calibration:
   dataset: the_pile
@@ -59,8 +60,9 @@ eval:
     num_fewshot: 0
 
 expert_analysis:
-  per_expert_reconstruction_error: true
-  effective_output_cardinality: true  # Distinct outputs per expert on calibration set
+  granularity: half_expert
+  per_expert_reconstruction_error: true       # Per half-expert
+  effective_output_cardinality: true          # Distinct outputs per half-expert on calibration set
   use_step0_traces: true
 
 profiling:

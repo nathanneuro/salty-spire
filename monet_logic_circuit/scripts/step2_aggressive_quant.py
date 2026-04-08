@@ -31,6 +31,12 @@ from monet_logic_circuit.quantization.aggressive import (
     run_quantization_sweep,
     compute_effective_output_cardinality,
 )
+from monet_logic_circuit.pipeline.signals import (
+    DecisionSignal,
+    OUTCOME_FAIL,
+    OUTCOME_PASS,
+    write_signal_into_results,
+)
 
 
 def main():
@@ -105,7 +111,7 @@ def main():
         print(f"  Best config: {best_config['bits']}-bit, {best_config['scope']}, {best_config['scale_granularity']}")
         results["best_config"] = best_config
     else:
-        best_config = {"bits": 1.58, "scope": "weights_only", "scale_granularity": "per_expert"}
+        best_config = {"bits": 1.58, "scope": "weights_only", "scale_granularity": "per_half_expert"}
 
     # Apply best quantization config
     import copy
@@ -125,7 +131,7 @@ def main():
         ternary_model,
         bits=1.58,
         scope="weights_only",
-        scale_granularity="per_expert",
+        scale_granularity="per_half_expert",
     )
 
     # QAT fine-tuning if enabled
@@ -183,9 +189,40 @@ def main():
     else:
         print("\n  Go/no-go: PASS")
 
-    # Save
+    # Canonical decision signal for the pipeline orchestrator. Gate on the
+    # ternary variant (the substrate for Steps 3a/3b), not the best-quality
+    # config, since ternary is what conversion actually consumes.
+    ternary_ppl = results.get("ternary_perplexity", {})
+    baseline_ppl = baseline_results.get("perplexity", {})
+    ppl_delta = float(ternary_ppl.get("loss_nats", 0.0)) - float(
+        baseline_ppl.get("loss_nats", 0.0)
+    )
+
+    downstream_loss_pct = 0.0
+    for _task, metrics in results.get("ternary_downstream_delta", {}).items():
+        for metric, delta in metrics.items():
+            if "acc" in metric.lower():
+                downstream_loss_pct = max(downstream_loss_pct, -float(delta) * 100.0)
+
+    ternary_cardinalities = list(results.get("ternary_cardinality", {}).values())
+    mean_cardinality = (
+        float(np.mean(ternary_cardinalities)) if ternary_cardinalities else 0.0
+    )
+
+    signal_metrics = {
+        "perplexity_delta_nats": ppl_delta,
+        "downstream_loss_pct": downstream_loss_pct,
+        "mean_output_cardinality": mean_cardinality,
+    }
+    signal = DecisionSignal(
+        step="2",
+        outcome=OUTCOME_PASS if go_no_go["pass"] else OUTCOME_FAIL,
+        metrics=signal_metrics,
+        reason=go_no_go.get("reason", ""),
+    )
+    results_out = write_signal_into_results(dict(results), signal)
     with open(output_dir / "results.json", "w") as f:
-        json.dump(results, f, indent=2, default=str)
+        json.dump(results_out, f, indent=2, default=str)
 
     # Save model checkpoints
     if config["outputs"].get("save_ternary_model"):
