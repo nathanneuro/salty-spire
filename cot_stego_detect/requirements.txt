@@ -1,0 +1,4 @@
+# cot_stego_detect has no runtime dependencies outside the Python
+# standard library. We keep this file as a deliberate empty marker so
+# that the project layout matches the other research artifacts in
+# this repo and `pip install -r` is a no-op rather than an error.
