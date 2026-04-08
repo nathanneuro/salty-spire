@@ -1,0 +1,58 @@
+experiment: step0_baseline
+
+model:
+  name: monet
+  checkpoint: null  # Set to path or HF hub ID of pretrained Monet checkpoint
+  device: auto      # auto, cpu, cuda, cuda:0, etc.
+
+data:
+  calibration:
+    dataset: the_pile
+    split: validation
+    num_tokens: 4_000_000  # ~4M tokens for calibration traces
+    seed: 42
+  eval:
+    dataset: the_pile
+    split: test
+    num_tokens: 1_000_000
+
+eval:
+  perplexity:
+    enabled: true
+    stride: 512
+    max_length: 2048
+  downstream:
+    enabled: true
+    tasks:
+      - lambada_openai
+      - hellaswag
+      - arc_easy
+      - arc_challenge
+      - piqa
+    num_fewshot: 0
+    batch_size: auto
+
+profiling:
+  enabled: true
+  num_batches: 50
+  batch_size: 1
+  sequence_length: 2048
+  measure_components: true  # Per-component FLOP breakdown
+
+expert_analysis:
+  enabled: true
+  activation_frequency: true     # How often router selects each expert
+  input_statistics: true         # Mean, variance, effective rank per expert
+  output_statistics: true        # Mean, variance per expert output
+  clustering: true               # Cluster experts by feature similarity
+  num_clusters: auto             # Auto-select via elbow method
+
+traces:
+  save: true
+  output_dir: outputs/step0/traces
+  format: safetensors  # Per-expert (input, output) pairs on calibration set
+
+outputs:
+  dir: outputs/step0
+  save_reference_table: true
+  save_expert_characterization: true

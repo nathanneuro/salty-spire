@@ -1,0 +1,70 @@
+experiment: step3c_end_to_end
+
+model:
+  base_checkpoint: null  # Original pretrained Monet
+  ternary_checkpoint: outputs/step2/ternary_model
+  circuits_dir: outputs/step3b  # Contains per-expert circuit decisions
+  device: auto
+
+hybrid_inference:
+  router: float          # Router stays in float precision
+  experts: logic_circuit  # Experts replaced with logic circuits
+  attention: float        # Attention stays in float
+  norms: float
+
+  input_binarization:
+    method: sign           # sign, stochastic, learned_threshold
+    bits: 1                # Start with strict binary, back off if needed
+    multi_bit_fallback: 4  # If binary fails, try this many bits
+
+  output_decoding:
+    per_expert: true       # Learned decoder per expert
+    hidden_dim: 64         # Small decoder MLP hidden dim
+
+eval:
+  perplexity:
+    enabled: true
+    stride: 512
+    max_length: 2048
+  downstream:
+    enabled: true
+    tasks:
+      - lambada_openai
+      - hellaswag
+      - arc_easy
+      - arc_challenge
+      - piqa
+    num_fewshot: 0
+
+  loss_decomposition:
+    enabled: true
+    # Measure each loss source independently:
+    # 1. Quantization loss (Step 2 delta)
+    # 2. Conversion loss (circuit vs quantized expert)
+    # 3. Interface loss (binarization of residual stream)
+    compare_against:
+      float_baseline: outputs/step0
+      quantized_baseline: outputs/step2
+
+interface_fine_tuning:
+  enabled: true
+  dataset: the_pile
+  split: train
+  num_tokens: 10_000_000
+  learning_rate: 5.0e-5
+  max_steps: 2000
+  trainable:
+    input_binarization: true
+    output_decoding: true
+    circuits: false  # Keep circuits frozen
+    router: false
+    attention: false
+
+profiling:
+  enabled: true
+  num_batches: 50
+
+outputs:
+  dir: outputs/step3c
+  save_hybrid_model: true
+  save_loss_decomposition: true

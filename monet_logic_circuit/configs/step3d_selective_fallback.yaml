@@ -1,0 +1,48 @@
+experiment: step3d_selective_fallback
+
+model:
+  base_checkpoint: null
+  ternary_checkpoint: outputs/step2/ternary_model
+  circuits_dir: outputs/step3b
+  hybrid_model_dir: outputs/step3c
+  device: auto
+
+fallback:
+  # Experts that failed conversion stay as quantized float
+  reconstruction_error_threshold: 0.05  # Max acceptable per-expert error
+  force_quantized_experts: []           # Manual override list
+  strategy: auto  # auto selects based on threshold; manual uses force list
+
+eval:
+  perplexity:
+    enabled: true
+    stride: 512
+    max_length: 2048
+  downstream:
+    enabled: true
+    tasks:
+      - lambada_openai
+      - hellaswag
+      - arc_easy
+      - arc_challenge
+      - piqa
+    num_fewshot: 0
+
+  conversion_statistics:
+    enabled: true
+    # Report: fraction exact-converted, fraction learned-converted, fraction fallback
+
+profiling:
+  enabled: true
+  num_batches: 50
+  report_honest_speedup: true  # Actual hybrid speed, not theoretical all-circuit speed
+
+outputs:
+  dir: outputs/step3d
+  save_final_model: true
+  save_conversion_report: true
+  save_per_expert_stats: true  # (method, circuit_size, reconstruction_error, activation_freq)
+
+targets:
+  max_fallback_fraction: 0.10  # Aim for <10% experts staying quantized
+  warning_threshold: 0.30      # >30% means converter needs improvement

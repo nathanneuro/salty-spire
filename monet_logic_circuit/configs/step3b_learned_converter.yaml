@@ -1,0 +1,53 @@
+experiment: step3b_learned_converter
+
+model:
+  ternary_checkpoint: outputs/step2/ternary_model
+  device: auto
+
+converter:
+  architecture:
+    output_format: fixed_topology  # Gate-choice logits on fixed wiring
+    topology:
+      depth: 8
+      width: 256
+      wiring: random_sparse
+      sparsity: 0.3
+    gate_types: [AND, OR, XOR, NAND, NOR, XNOR, BUF, NOT]
+
+  training:
+    supervised_data_dir: outputs/step3a/circuits  # Expert->circuit pairs from 3a
+    calibration_traces_dir: outputs/step0/traces
+
+    loss:
+      supervised_weight: 1.0       # Match known-good circuits from 3a
+      distillation_weight: 1.0     # Match quantized expert outputs
+      circuit_size_penalty: 0.01   # Encourage smaller circuits
+
+    optimizer:
+      type: adamw
+      learning_rate: 3.0e-4
+      weight_decay: 0.01
+      warmup_steps: 1000
+
+    batch_size: 32
+    max_steps: 50000
+    eval_interval: 1000
+    num_train_experts: null   # Auto-split from available experts
+    num_val_experts: null
+
+    relaxation:
+      method: straight_through  # STE for discrete gate selection
+      temperature: 1.0
+      temperature_schedule: cosine_anneal
+      min_temperature: 0.1
+
+eval:
+  per_expert_reconstruction_error: true
+  circuit_size_distribution: true
+  generalization_to_unseen: true  # Test on experts not in training set
+
+outputs:
+  dir: outputs/step3b
+  save_converter_model: true
+  save_converted_circuits: true
+  save_per_expert_decisions: true  # Exact (from 3a) vs learned (from 3b) per expert
