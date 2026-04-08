@@ -25,6 +25,13 @@ from monet_logic_circuit.conversion.exact import (
     run_exact_conversion,
     ExactConversionResult,
 )
+from monet_logic_circuit.pipeline.signals import (
+    DecisionSignal,
+    OUTCOME_BLOWN_UP,
+    OUTCOME_DREAM_CASE,
+    OUTCOME_TRACTABLE,
+    write_signal_into_results,
+)
 
 
 def main():
@@ -142,17 +149,20 @@ def main():
               f"median={np.median(gate_counts):.0f}, "
               f"max={np.max(gate_counts)}")
 
-    # Determine outcome
+    # Determine outcome. These three codes match the branches in
+    # pipeline.yaml and are the canonical DecisionSignal outcomes for
+    # step 3a (dream_case skips 3b, tractable/blown_up both run 3b).
     small_frac = size_classes["small"] / total if total > 0 else 0
+    blown_up_frac = size_classes["blown_up"] / total if total > 0 else 0
     if small_frac > 0.5:
-        outcome = "dream_case"
+        outcome = OUTCOME_DREAM_CASE
         print("\n  OUTCOME: Dream case -- most half-experts have small circuits.")
         print("  Scale to all half-experts and proceed to 3c.")
-    elif size_classes["blown_up"] / total < 0.5:
-        outcome = "tractable"
+    elif blown_up_frac < 0.5:
+        outcome = OUTCOME_TRACTABLE
         print("\n  OUTCOME: Tractable -- proceed to 3b for learned converter.")
     else:
-        outcome = "blown_up"
+        outcome = OUTCOME_BLOWN_UP
         print("\n  OUTCOME: Blown up -- learned converter (3b) is necessary.")
 
     # Save results
@@ -182,8 +192,27 @@ def main():
         ],
     }
 
+    # Canonical decision signal for the orchestrator. Step 3a's branches
+    # in pipeline.yaml switch on ``outcome`` directly, so the metrics are
+    # reported for the trace but not necessarily gated on.
+    signal = DecisionSignal(
+        step="3a",
+        outcome=outcome,
+        metrics={
+            "small_frac": float(small_frac),
+            "blown_up_frac": float(blown_up_frac),
+            "tractable_frac": float(
+                size_classes["tractable"] / total if total > 0 else 0
+            ),
+            "mean_gates": float(np.mean(gate_counts)) if gate_counts else 0.0,
+            "p90_gates": float(np.percentile(gate_counts, 90)) if gate_counts else 0.0,
+            "verified_exact_frac": float(verified_count / total) if total > 0 else 0.0,
+        },
+        reason=f"small={size_classes['small']}, tractable={size_classes['tractable']}, blown_up={size_classes['blown_up']}",
+    )
+    results_out = write_signal_into_results(dict(results), signal)
     with open(output_dir / "results.json", "w") as f:
-        json.dump(results, f, indent=2)
+        json.dump(results_out, f, indent=2)
 
     # Save individual circuits for use by 3b
     circuits_dir = output_dir / "circuits"

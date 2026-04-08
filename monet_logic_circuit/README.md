@@ -73,54 +73,117 @@ config override file.
 
 ```
 monet_logic_circuit/
-├── configs/           # YAML experiment configs (one per step)
+├── configs/           # YAML experiment configs (one per step) + pipeline.yaml
 ├── docs/              # Design notes (model selection, architecture)
-├── scripts/           # Runnable experiment scripts
+├── scripts/           # Runnable experiment scripts + run_pipeline.py
 ├── models/            # Monet model loading, half-expert wrappers, registry
 ├── data/              # Calibration dataset, half-expert trace I/O
 ├── quantization/      # Gentle + aggressive quantization
 ├── conversion/        # Exact (Aytekin) + learned circuit conversion
+├── pipeline/          # Decision signals, gates, orchestrator
 └── eval/              # Perplexity, downstream, profiling, expert analysis
 ```
 
 ## Usage
 
+### Automated pipeline (recommended)
+
+The orchestrator runs every step in sequence, gates each step's
+``decision_signal`` against the thresholds in
+[`configs/pipeline.yaml`](configs/pipeline.yaml), and either proceeds,
+takes a branch (Step 3a's `dream_case` skips Step 3b), or halts. The
+pipeline trace is written to ``outputs/pipeline_trace.json``.
+
 ```bash
-# Step 0: Baseline evaluation
-python -m monet_logic_circuit.scripts.step0_baseline --config configs/step0_baseline.yaml
+# Run the full pipeline at the default scale (vd-850M)
+python -m monet_logic_circuit.scripts.run_pipeline \
+    --pipeline monet_logic_circuit/configs/pipeline.yaml
 
-# Step 1: Gentle quantization
-python -m monet_logic_circuit.scripts.step1_gentle_quant --config configs/step1_gentle_quant.yaml
+# Preview the planned execution without running anything
+python -m monet_logic_circuit.scripts.run_pipeline \
+    --pipeline monet_logic_circuit/configs/pipeline.yaml \
+    --dry-run
 
-# Step 2: Aggressive quantization
-python -m monet_logic_circuit.scripts.step2_aggressive_quant --config configs/step2_aggressive_quant.yaml
+# Resume after a crash
+python -m monet_logic_circuit.scripts.run_pipeline \
+    --pipeline monet_logic_circuit/configs/pipeline.yaml \
+    --from-step 3b
 
-# Step 3a: Exact conversion
-python -m monet_logic_circuit.scripts.step3a_exact_conversion --config configs/step3a_exact_conversion.yaml
-
-# Step 3b: Learned converter
-python -m monet_logic_circuit.scripts.step3b_learned_converter --config configs/step3b_learned_converter.yaml
-
-# Step 3c: End-to-end evaluation
-python -m monet_logic_circuit.scripts.step3c_end_to_end --config configs/step3c_end_to_end.yaml
-
-# Step 3d: Selective fallback
-python -m monet_logic_circuit.scripts.step3d_selective_fallback --config configs/step3d_selective_fallback.yaml
+# Run the pipeline at every scale in scale_progression, advancing only
+# when the previous scale's final verdict passes
+python -m monet_logic_circuit.scripts.run_pipeline \
+    --pipeline monet_logic_circuit/configs/pipeline.yaml \
+    --scale-automatically
 ```
+
+The full set of pre-committed thresholds and branching rules lives in
+``configs/pipeline.yaml``. Edit them in one place; every step script
+emits a canonical ``decision_signal`` block in its ``results.json`` so
+the orchestrator can read it back.
+
+### Running individual steps
+
+Each step can still be invoked directly. The orchestrator just calls
+these scripts as subprocesses, so the standalone CLIs are unchanged.
+
+```bash
+python -m monet_logic_circuit.scripts.step0_baseline          --config monet_logic_circuit/configs/step0_baseline.yaml
+python -m monet_logic_circuit.scripts.step1_gentle_quant      --config monet_logic_circuit/configs/step1_gentle_quant.yaml
+python -m monet_logic_circuit.scripts.step2_aggressive_quant  --config monet_logic_circuit/configs/step2_aggressive_quant.yaml
+python -m monet_logic_circuit.scripts.step3a_exact_conversion --config monet_logic_circuit/configs/step3a_exact_conversion.yaml
+python -m monet_logic_circuit.scripts.step3b_learned_converter --config monet_logic_circuit/configs/step3b_learned_converter.yaml
+python -m monet_logic_circuit.scripts.step3c_end_to_end       --config monet_logic_circuit/configs/step3c_end_to_end.yaml
+python -m monet_logic_circuit.scripts.step3d_selective_fallback --config monet_logic_circuit/configs/step3d_selective_fallback.yaml
+```
+
+### Decision signal contract
+
+Every step writes a ``decision_signal`` block into its ``results.json``:
+
+```json
+{
+  "decision_signal": {
+    "step": "3a",
+    "outcome": "tractable",
+    "metrics": {"small_frac": 0.31, "blown_up_frac": 0.18, "mean_gates": 52000},
+    "reason": "small=31, tractable=51, blown_up=18"
+  }
+}
+```
+
+Outcome codes are ``pass``, ``fail``, ``dream_case``, ``tractable``,
+``blown_up``. Most steps emit ``pass``/``fail``; Step 3a uses the
+qualitative regimes for branching. Gates in pipeline.yaml threshold
+against the numeric values in ``metrics``.
 
 ## Go/No-Go Criteria
 
-- **After Step 1:** If gentle quantization loses >1-2% downstream or
-  >0.1 nats perplexity, investigate Monet-specific quantization sensitivity
-  before proceeding.
-- **After Step 2:** If aggressive quantization loses >5% downstream or
-  >0.5 nats perplexity even with fine-tuning, reassess the project
-  ceiling.
-- **After Step 3:** Target regime is "within 1-2% of baseline quality at
-  10x+ speed improvement."
-- **After Step 3a on 850M:** If most half-experts produce circuits above
-  the `tractable` threshold (100k gates), the Aytekin approach has blown
-  up on the smallest model and scaling is not worth attempting. Route all
-  effort to Step 3b.
-- **850M -> 1.4B scaling break:** Investigate `d_expert` sensitivity
-  before moving to 4.1B.
+These thresholds are pre-committed in
+[`configs/pipeline.yaml`](configs/pipeline.yaml) and enforced
+automatically by the orchestrator. Editing the gates there changes the
+go/no-go behavior of the automated pipeline runs.
+
+- **After Step 1:** If gentle quantization loses >2% downstream or
+  >0.1 nats perplexity, halt — Monet has unusual quantization sensitivity
+  worth investigating before moving on.
+- **After Step 2:** If aggressive quantization loses >5% downstream,
+  >0.5 nats perplexity, or collapses mean output cardinality below 4,
+  halt — the ternary substrate isn't usable for Steps 3a/3b.
+- **After Step 3a:** Branch on outcome.
+  - `dream_case` (most half-experts have small circuits): skip Step 3b
+    and go straight to end-to-end evaluation.
+  - `tractable`: run Step 3b to amortize the long tail.
+  - `blown_up`: still run Step 3b — the learned converter is now the
+    main hope.
+- **After Step 3b:** If validation reconstruction NMSE > 0.05, halt —
+  the converter isn't accurate enough for selective fallback to recover
+  the long tail.
+- **After Step 3c:** Warn (don't halt) if the hybrid model's perplexity
+  delta exceeds 0.15 nats. The loss decomposition tells us whether 3d
+  fallback can recover it; halting here would prevent 3d from running
+  the diagnostic.
+- **Final verdict (after Step 3d):** Within 0.1 nats perplexity delta
+  AND ≥10x speedup. This is the "would we ship it?" check.
+- **850M → 1.4B scaling break:** Investigate `d_expert` sensitivity
+  before moving to 4.1B. With ``--scale-automatically``, the orchestrator
+  halts at the first scale whose final verdict fails.

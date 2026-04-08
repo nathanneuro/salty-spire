@@ -25,6 +25,12 @@ from monet_logic_circuit.eval.downstream import (
     format_results_table,
 )
 from monet_logic_circuit.eval.profiling import profile_model
+from monet_logic_circuit.pipeline.signals import (
+    DecisionSignal,
+    OUTCOME_FAIL,
+    OUTCOME_PASS,
+    write_signal_into_results,
+)
 
 
 def main():
@@ -52,6 +58,7 @@ def main():
     model, model_config = load_monet_model(
         config["model"]["base_checkpoint"],
         device=config["model"]["device"],
+        allowed_decompositions=config["model"].get("allowed_decompositions"),
     )
     tokenizer = _load_tokenizer(config["model"]["base_checkpoint"])
     device = next(model.parameters()).device
@@ -72,7 +79,8 @@ def main():
         base_model=model,
         circuits=circuits,
         quantized_fallbacks=quantized_fallbacks,
-        hidden_dim=model_config.hidden_dim,
+        half_expert_input_dim=model_config.hidden_dim // 2,
+        half_expert_output_dim=model_config.expert_dim,
         binarizer_config={
             "method": config["hybrid_inference"]["input_binarization"]["method"],
             "bits": config["hybrid_inference"]["input_binarization"]["bits"],
@@ -158,9 +166,35 @@ def main():
     # Conversion stats
     results["conversion_stats"] = hybrid_model.get_conversion_stats()
 
-    # Save
+    # Canonical decision signal for the orchestrator. Report the
+    # perplexity delta after interface fine-tuning if available, else
+    # the pre-FT number. The pipeline default is warn-not-halt here
+    # because the loss decomposition tells us whether 3d can recover.
+    float_loss_nats = float(float_baseline.get("perplexity", {}).get("loss_nats", 0.0))
+    after_ppl = results.get("perplexity_after_ft") or results.get("perplexity_before_ft", {})
+    hybrid_loss_nats = float(after_ppl.get("loss_nats", 0.0))
+    ppl_delta = hybrid_loss_nats - float_loss_nats
+
+    decomposition = results.get("loss_decomposition", {})
+    signal_metrics = {
+        "perplexity_delta_nats": ppl_delta,
+        "quantization_delta_nats": float(decomposition.get("quantization_delta", 0.0)),
+        "conversion_delta_nats": float(decomposition.get("conversion_delta", 0.0)),
+        "interface_delta_nats": float(decomposition.get("interface_delta", 0.0)),
+        "circuit_fraction": float(
+            results["conversion_stats"].get("circuit_fraction", 0.0)
+        ),
+    }
+    gate_threshold = 0.15  # Mirror of pipeline.yaml
+    signal = DecisionSignal(
+        step="3c",
+        outcome=OUTCOME_PASS if ppl_delta <= gate_threshold else OUTCOME_FAIL,
+        metrics=signal_metrics,
+        reason=f"hybrid perplexity delta {ppl_delta:+.4f} nats",
+    )
+    results_out = write_signal_into_results(dict(results), signal)
     with open(output_dir / "results.json", "w") as f:
-        json.dump(results, f, indent=2, default=str)
+        json.dump(results_out, f, indent=2, default=str)
 
     print(f"\nResults saved to {output_dir}")
 

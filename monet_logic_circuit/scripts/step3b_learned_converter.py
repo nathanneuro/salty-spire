@@ -27,6 +27,12 @@ from monet_logic_circuit.conversion.learned import (
     ConverterTrainer,
     ConverterConfig,
 )
+from monet_logic_circuit.pipeline.signals import (
+    DecisionSignal,
+    OUTCOME_FAIL,
+    OUTCOME_PASS,
+    write_signal_into_results,
+)
 
 
 class HalfExpertDataset(Dataset):
@@ -183,8 +189,31 @@ def main():
         },
     }
 
+    # Canonical decision signal for the orchestrator. Gate is on the
+    # validation reconstruction NMSE — that's the predictor of how
+    # usable the learned circuits will be in Step 3c.
+    val_nmse = float(val_metrics.get("mean_error", 0.0))
+    gate_threshold = 0.05  # Mirror of pipeline.yaml; value reported for trace.
+    signal = DecisionSignal(
+        step="3b",
+        outcome=OUTCOME_PASS if val_nmse <= gate_threshold else OUTCOME_FAIL,
+        metrics={
+            "val_reconstruction_nmse": val_nmse,
+            "train_reconstruction_nmse": float(train_metrics.get("mean_error", 0.0)),
+            "val_reconstruction_p90": float(val_metrics.get("p90_error", 0.0)),
+            "exact_fraction": (
+                results["summary"]["exact_circuit"] / results["summary"]["total"]
+                if results["summary"]["total"] else 0.0
+            ),
+        },
+        reason=(
+            f"val NMSE {val_nmse:.6f} "
+            f"({'<=' if val_nmse <= gate_threshold else '>'} {gate_threshold})"
+        ),
+    )
+    results_out = write_signal_into_results(dict(results), signal)
     with open(output_dir / "results.json", "w") as f:
-        json.dump(results, f, indent=2, default=str)
+        json.dump(results_out, f, indent=2, default=str)
 
     torch.save(converter.state_dict(), output_dir / "converter.pt")
     print(f"\nResults saved to {output_dir}")

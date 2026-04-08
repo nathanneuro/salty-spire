@@ -38,6 +38,11 @@ from monet_logic_circuit.eval.expert_analysis import (
     compute_activation_frequencies,
     analyze_expert_population,
 )
+from monet_logic_circuit.pipeline.signals import (
+    DecisionSignal,
+    OUTCOME_PASS,
+    write_signal_into_results,
+)
 
 
 def main():
@@ -190,6 +195,23 @@ def main():
     # Save all results
     with open(output_dir / "reference_numbers.json", "w") as f:
         json.dump(results, f, indent=2, default=str)
+
+    # Also write a results.json with a canonical decision signal for the
+    # orchestrator. Step 0 always passes; downstream steps gate against
+    # the metrics here, not against step 0 itself.
+    baseline_metrics = {
+        "perplexity": float(results.get("perplexity", {}).get("perplexity", 0.0)),
+        "loss_nats": float(results.get("perplexity", {}).get("loss_nats", 0.0)),
+    }
+    signal = DecisionSignal(
+        step="0",
+        outcome=OUTCOME_PASS,
+        metrics=baseline_metrics,
+        reason="baseline reference established",
+    )
+    results_out = write_signal_into_results(dict(results), signal)
+    with open(output_dir / "results.json", "w") as f:
+        json.dump(results_out, f, indent=2, default=str)
 
     print(f"\nAll results saved to {output_dir}")
 

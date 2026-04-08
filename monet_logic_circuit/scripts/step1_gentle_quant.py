@@ -29,6 +29,12 @@ from monet_logic_circuit.quantization.gentle import (
     apply_gentle_quantization,
     measure_per_half_expert_reconstruction,
 )
+from monet_logic_circuit.pipeline.signals import (
+    DecisionSignal,
+    OUTCOME_FAIL,
+    OUTCOME_PASS,
+    write_signal_into_results,
+)
 
 
 def main():
@@ -151,9 +157,19 @@ def main():
     else:
         print("\n  Go/no-go: PASS")
 
-    # Save
+    # Canonical decision signal for the pipeline orchestrator.
+    signal = DecisionSignal(
+        step="1",
+        outcome=OUTCOME_PASS if go_no_go["pass"] else OUTCOME_FAIL,
+        metrics={
+            "perplexity_delta_nats": float(go_no_go.get("ppl_delta", 0.0)),
+            "downstream_loss_pct": float(go_no_go.get("downstream_loss_pct", 0.0)),
+        },
+        reason=go_no_go.get("reason", ""),
+    )
+    results_out = write_signal_into_results(dict(results), signal)
     with open(output_dir / "results.json", "w") as f:
-        json.dump(results, f, indent=2, default=str)
+        json.dump(results_out, f, indent=2, default=str)
 
     print(f"\nResults saved to {output_dir}")
 

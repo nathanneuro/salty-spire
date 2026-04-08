@@ -25,6 +25,12 @@ from monet_logic_circuit.eval.downstream import (
     format_results_table,
 )
 from monet_logic_circuit.eval.profiling import profile_model
+from monet_logic_circuit.pipeline.signals import (
+    DecisionSignal,
+    OUTCOME_FAIL,
+    OUTCOME_PASS,
+    write_signal_into_results,
+)
 
 
 def main():
@@ -185,7 +191,8 @@ def main():
     print(f"  Circuit coverage: {n_circuit/total*100:.1f}%")
 
     within_quality = abs(ppl_delta) < 0.1  # ~1-2% quality
-    good_speedup = results.get("speedup_vs_baseline", 0) >= 10
+    speedup = float(results.get("speedup_vs_baseline", 0.0))
+    good_speedup = speedup >= 10
     if within_quality and good_speedup:
         print("\n  VERDICT: Within target regime (1-2% quality, 10x+ speed)")
         print("  Proceed to scaling and write-up.")
@@ -195,9 +202,26 @@ def main():
         print("\n  VERDICT: Quality loss too high for the achieved speedup.")
         print("  See loss decomposition in Step 3c to identify dominant cost.")
 
-    # Save
+    # Canonical decision signal for the orchestrator. This step's metrics
+    # are also what the pipeline's final_verdict gates evaluate against.
+    signal_metrics = {
+        "perplexity_delta_nats": float(ppl_delta),
+        "speedup_vs_baseline": speedup,
+        "fallback_fraction": float(fallback_frac),
+        "circuit_fraction": float(n_circuit / total) if total else 0.0,
+    }
+    signal = DecisionSignal(
+        step="3d",
+        outcome=OUTCOME_PASS if (within_quality and good_speedup) else OUTCOME_FAIL,
+        metrics=signal_metrics,
+        reason=(
+            f"ppl_delta={ppl_delta:+.4f}, speedup={speedup:.1f}x, "
+            f"fallback={fallback_frac:.1%}"
+        ),
+    )
+    results_out = write_signal_into_results(dict(results), signal)
     with open(output_dir / "results.json", "w") as f:
-        json.dump(results, f, indent=2, default=str)
+        json.dump(results_out, f, indent=2, default=str)
 
     print(f"\nAll results saved to {output_dir}")
 
