@@ -1,0 +1,79 @@
+experiment: step2_aggressive_quant
+
+model:
+  name: monet
+  checkpoint: null
+  device: auto
+
+baseline:
+  reference_dir: outputs/step0
+  gentle_quant_dir: outputs/step1  # For comparison
+
+quantization:
+  sweep:
+    bits: [1, 1.58, 2]                              # 1-bit, ternary, 2-bit
+    scope: [weights_only, weights_and_activations]    # What to quantize
+    scale_granularity: [per_tensor, per_channel, per_expert]  # Scale sharing
+  targets:
+    experts: true
+    attention: false
+    norms: false
+    embeddings: false
+  ternary:
+    values: [-1, 0, 1]       # BitNet-style ternary
+    scale_per_expert: true
+
+fine_tuning:
+  enabled: true
+  method: qat  # Quantization-aware training
+  dataset: the_pile
+  split: train
+  num_tokens: 50_000_000  # ~50M tokens, modest budget
+  learning_rate: 1.0e-5
+  warmup_steps: 500
+  batch_size: 8
+  gradient_accumulation: 4
+  max_steps: 5000
+  freeze_non_expert: true  # Only update expert weights during QAT
+
+calibration:
+  dataset: the_pile
+  split: train
+  num_samples: 256
+  seq_length: 2048
+  seed: 42
+
+eval:
+  perplexity:
+    enabled: true
+    stride: 512
+    max_length: 2048
+  downstream:
+    enabled: true
+    tasks:
+      - lambada_openai
+      - hellaswag
+      - arc_easy
+      - arc_challenge
+      - piqa
+    num_fewshot: 0
+
+expert_analysis:
+  per_expert_reconstruction_error: true
+  effective_output_cardinality: true  # Distinct outputs per expert on calibration set
+  use_step0_traces: true
+
+profiling:
+  enabled: true
+  num_batches: 50
+
+outputs:
+  dir: outputs/step2
+  save_best_quality_model: true
+  save_ternary_model: true  # Always save ternary variant
+  save_sweep_results: true
+  save_cardinality_stats: true
+
+go_no_go:
+  max_downstream_loss_pct: 5.0
+  max_perplexity_delta_nats: 0.5

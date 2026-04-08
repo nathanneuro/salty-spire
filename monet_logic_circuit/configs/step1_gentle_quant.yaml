@@ -1,0 +1,66 @@
+experiment: step1_gentle_quant
+
+model:
+  name: monet
+  checkpoint: null  # Pretrained Monet checkpoint
+  device: auto
+
+baseline:
+  reference_dir: outputs/step0  # Step 0 outputs for comparison
+
+quantization:
+  method: gptq  # gptq or awq
+  bits: 4       # 4 or 8
+  targets:
+    experts: true
+    attention: false  # Keep attention in float
+    norms: false      # Keep norms in float
+    embeddings: false # Keep embeddings in float
+  gptq:
+    group_size: 128
+    damp_percent: 0.01
+    desc_act: true
+    sym: true
+  awq:
+    group_size: 128
+    zero_point: true
+
+calibration:
+  dataset: the_pile
+  split: train
+  num_samples: 128
+  seq_length: 2048
+  seed: 42
+
+eval:
+  perplexity:
+    enabled: true
+    stride: 512
+    max_length: 2048
+  downstream:
+    enabled: true
+    tasks:
+      - lambada_openai
+      - hellaswag
+      - arc_easy
+      - arc_challenge
+      - piqa
+    num_fewshot: 0
+
+expert_analysis:
+  per_expert_reconstruction_error: true  # Quantized vs float output on calibration set
+  use_step0_traces: true                 # Load cached traces from Step 0
+
+profiling:
+  enabled: true
+  num_batches: 50
+
+outputs:
+  dir: outputs/step1
+  save_quantized_model: true
+  save_quality_delta_table: true
+  save_reconstruction_error_distribution: true
+
+go_no_go:
+  max_downstream_loss_pct: 2.0   # Abort if >2% downstream loss
+  max_perplexity_delta_nats: 0.1 # Abort if >0.1 nats perplexity increase
