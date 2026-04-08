@@ -211,7 +211,7 @@ def _profile_components(
 def estimate_flops_per_token(
     num_layers: int,
     hidden_dim: int,
-    expert_hidden_dim: int,
+    expert_dim: int,
     num_attention_heads: int,
     vocab_size: int,
     top_k: int,
@@ -219,10 +219,11 @@ def estimate_flops_per_token(
 ) -> dict[str, int]:
     """Estimate FLOPs per token for each component category.
 
-    Uses standard transformer FLOP estimates adapted for MoE.
+    Uses standard transformer FLOP estimates adapted for Monet's product-key
+    MoE. ``expert_dim`` is the d_expert of a single half-expert's output
+    subspace (12/16/24 at 850M/1.4B/4.1B); top_k half-experts on each of
+    the two product-key axes are activated per token.
     """
-    head_dim = hidden_dim // num_attention_heads
-
     # Attention: QKV projection + attention scores + output projection
     attn_flops = num_layers * (
         3 * 2 * hidden_dim * hidden_dim  # QKV
@@ -230,11 +231,15 @@ def estimate_flops_per_token(
         + 2 * hidden_dim * hidden_dim  # Output
     )
 
-    # Expert FFN: top_k experts activated per token
-    expert_flops = num_layers * top_k * (
-        2 * hidden_dim * expert_hidden_dim  # Up projection
-        + 2 * expert_hidden_dim * hidden_dim  # Down projection
+    # Half-expert FFN: top_k activated per axis, two axes per layer.
+    # Each half-expert sees half the residual stream (VD) and maps into a
+    # d_expert output subspace.
+    half_input_dim = hidden_dim // 2
+    half_expert_flops = num_layers * 2 * top_k * (
+        2 * half_input_dim * expert_dim  # Up projection
+        + 2 * expert_dim * half_input_dim  # Down projection
     )
+    expert_flops = half_expert_flops
 
     # Embedding + unembedding
     embed_flops = 2 * hidden_dim * vocab_size

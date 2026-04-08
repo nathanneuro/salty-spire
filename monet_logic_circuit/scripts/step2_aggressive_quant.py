@@ -105,7 +105,7 @@ def main():
         print(f"  Best config: {best_config['bits']}-bit, {best_config['scope']}, {best_config['scale_granularity']}")
         results["best_config"] = best_config
     else:
-        best_config = {"bits": 1.58, "scope": "weights_only", "scale_granularity": "per_expert"}
+        best_config = {"bits": 1.58, "scope": "weights_only", "scale_granularity": "per_half_expert"}
 
     # Apply best quantization config
     import copy
@@ -125,7 +125,7 @@ def main():
         ternary_model,
         bits=1.58,
         scope="weights_only",
-        scale_granularity="per_expert",
+        scale_granularity="per_half_expert",
     )
 
     # QAT fine-tuning if enabled

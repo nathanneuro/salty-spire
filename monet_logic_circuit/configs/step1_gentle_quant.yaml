@@ -2,8 +2,9 @@ experiment: step1_gentle_quant
 
 model:
   name: monet
-  checkpoint: null  # Pretrained Monet checkpoint
+  checkpoint: MonetLLM/monet-vd-850M-100BT-hf
   device: auto
+  allowed_decompositions: [vd]
 
 baseline:
   reference_dir: outputs/step0  # Step 0 outputs for comparison
@@ -12,10 +13,11 @@ quantization:
   method: gptq  # gptq or awq
   bits: 4       # 4 or 8
   targets:
-    experts: true
-    attention: false  # Keep attention in float
-    norms: false      # Keep norms in float
-    embeddings: false # Keep embeddings in float
+    experts: true         # Applied at the half-expert granularity
+    attention: false      # Keep attention in float
+    norms: false          # Keep norms in float
+    embeddings: false     # Keep embeddings in float
+    routers: false        # Keep both product-key routers in float
   gptq:
     group_size: 128
     damp_percent: 0.01
@@ -48,8 +50,9 @@ eval:
     num_fewshot: 0
 
 expert_analysis:
-  per_expert_reconstruction_error: true  # Quantized vs float output on calibration set
-  use_step0_traces: true                 # Load cached traces from Step 0
+  granularity: half_expert                    # Per half-expert, not per effective expert
+  per_expert_reconstruction_error: true       # Quantized vs float output on calibration set
+  use_step0_traces: true                      # Load cached traces from Step 0
 
 profiling:
   enabled: true

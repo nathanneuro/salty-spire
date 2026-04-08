@@ -1,7 +1,8 @@
 """Step 3a: Exact conversion via Aytekin construction.
 
-Deterministic pipeline: ternary expert -> decision tree -> logic circuit -> minimized circuit.
-Tests whether this works at Monet-expert scale.
+Deterministic pipeline: ternary half-expert -> decision tree -> logic
+circuit -> minimized circuit. Tests whether this works at Monet's
+half-expert scale (2N per layer; N = 512).
 
 Usage:
     python -m monet_logic_circuit.scripts.step3a_exact_conversion --config configs/step3a_exact_conversion.yaml
@@ -15,7 +16,10 @@ import yaml
 import numpy as np
 import torch
 
-from monet_logic_circuit.models.monet_loader import load_monet_model, get_expert_modules
+from monet_logic_circuit.models.monet_loader import (
+    load_monet_model,
+    get_half_expert_modules,
+)
 from monet_logic_circuit.data.expert_traces import ExpertTraceStore
 from monet_logic_circuit.conversion.exact import (
     run_exact_conversion,
@@ -37,10 +41,15 @@ def main():
     # Load ternary model from Step 2
     print("Loading ternary model...")
     ternary_path = Path(config["model"]["ternary_checkpoint"])
-    model, model_config = load_monet_model(str(ternary_path), device=config["model"]["device"])
+    model, model_config = load_monet_model(
+        str(ternary_path),
+        device=config["model"]["device"],
+        allowed_decompositions=config["model"].get("allowed_decompositions"),
+    )
 
-    # Load reconstruction errors from Step 2 to select easy experts
-    recon_dir = Path(config["conversion"]["expert_subset"]["reconstruction_error_dir"])
+    # Load reconstruction errors from Step 2 to select easy half-experts
+    he_cfg = config["conversion"]["half_expert_subset"]
+    recon_dir = Path(he_cfg["reconstruction_error_dir"])
     recon_path = recon_dir / "results.json"
     reconstruction_errors = {}
     if recon_path.exists():
@@ -48,22 +57,42 @@ def main():
             step2_results = json.load(f)
             reconstruction_errors = step2_results.get("ternary_cardinality", {})
 
-    # Select expert subset
-    all_experts = get_expert_modules(model)
-    num_to_select = config["conversion"]["expert_subset"]["num_experts"]
-    selection = config["conversion"]["expert_subset"]["selection"]
+    # Select half-expert subset
+    all_half_experts = get_half_expert_modules(model)
+    num_to_select = he_cfg["num_half_experts"]
+    selection = he_cfg["selection"]
+    balance_axes = he_cfg.get("balance_axes", True)
 
     if selection == "easy_first" and reconstruction_errors:
         # Sort by reconstruction error, take easiest
-        sorted_experts = sorted(
-            all_experts,
+        sorted_he = sorted(
+            all_half_experts,
             key=lambda x: reconstruction_errors.get(x[0], float("inf")),
         )
-        selected = sorted_experts[:num_to_select]
     else:
-        selected = all_experts[:num_to_select]
+        sorted_he = list(all_half_experts)
 
-    print(f"Selected {len(selected)} experts for exact conversion")
+    if balance_axes:
+        # Interleave by axis to keep both product-key axes represented.
+        # Half-expert name convention: layerL_axisA_heH
+        def axis_of(name: str) -> int:
+            for tok in name.split("_"):
+                if tok.startswith("axis"):
+                    return int(tok[len("axis"):])
+            return 0
+
+        axis0 = [he for he in sorted_he if axis_of(he[0]) == 0]
+        axis1 = [he for he in sorted_he if axis_of(he[0]) == 1]
+        interleaved = []
+        for a, b in zip(axis0, axis1):
+            interleaved.extend([a, b])
+        interleaved.extend(axis0[len(axis1):])
+        interleaved.extend(axis1[len(axis0):])
+        selected = interleaved[:num_to_select]
+    else:
+        selected = sorted_he[:num_to_select]
+
+    print(f"Selected {len(selected)} half-experts for exact conversion")
 
     # Load trace store for verification
     trace_store = ExpertTraceStore(
@@ -77,10 +106,15 @@ def main():
         "tractable": config["thresholds"]["tractable_circuit_max_gates"],
     }
 
+    # VD half-experts see a disjoint slice of the residual stream (d_model/2)
+    # and output into a d_expert subspace.
+    half_expert_input_dim = model_config.hidden_dim // 2
+    half_expert_output_dim = model_config.expert_dim
+
     conversion_results = run_exact_conversion(
         selected,
-        input_dim=model_config.hidden_dim,
-        output_dim=model_config.hidden_dim,
+        input_dim=half_expert_input_dim,
+        output_dim=half_expert_output_dim,
         trace_store=trace_store,
         tool=config["conversion"]["logic_minimization"]["tool"],
         thresholds=thresholds,
@@ -98,7 +132,7 @@ def main():
             verified_count += 1
 
     total = len(conversion_results)
-    print(f"\nConversion results ({total} experts):")
+    print(f"\nConversion results ({total} half-experts):")
     print(f"  Small (<{thresholds['small']} gates): {size_classes['small']}")
     print(f"  Tractable (<{thresholds['tractable']} gates): {size_classes['tractable']}")
     print(f"  Blown up: {size_classes['blown_up']}")
@@ -112,8 +146,8 @@ def main():
     small_frac = size_classes["small"] / total if total > 0 else 0
     if small_frac > 0.5:
         outcome = "dream_case"
-        print("\n  OUTCOME: Dream case -- most experts have small circuits.")
-        print("  Scale to all experts and proceed to 3c.")
+        print("\n  OUTCOME: Dream case -- most half-experts have small circuits.")
+        print("  Scale to all half-experts and proceed to 3c.")
     elif size_classes["blown_up"] / total < 0.5:
         outcome = "tractable"
         print("\n  OUTCOME: Tractable -- proceed to 3b for learned converter.")
@@ -123,7 +157,7 @@ def main():
 
     # Save results
     results = {
-        "num_experts_converted": total,
+        "num_half_experts_converted": total,
         "size_distribution": size_classes,
         "gate_count_stats": {
             "mean": float(np.mean(gate_counts)) if gate_counts else 0,
@@ -134,7 +168,7 @@ def main():
         },
         "verified_exact_count": verified_count,
         "outcome": outcome,
-        "per_expert": [
+        "per_half_expert": [
             {
                 "name": r.expert_name,
                 "tree_depth": r.tree_depth,

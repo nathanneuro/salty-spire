@@ -1,4 +1,9 @@
-"""Expert population analysis: activation frequencies, clustering, diagnostics."""
+"""Half-expert population analysis: activation frequencies, clustering, diagnostics.
+
+Monet has a product-key decomposition with 2N half-experts per layer (two
+axes of N each). Activation frequencies are reported per (layer, axis,
+half_expert_idx), matching the HalfExpertWrapper naming scheme.
+"""
 
 from typing import Optional
 
@@ -13,9 +18,11 @@ def compute_activation_frequencies(
     dataloader,
     device: str = "cuda",
 ) -> dict[str, float]:
-    """Count how often the router selects each expert across the dataset.
+    """Count how often each product-key router selects each half-expert.
 
     Hooks into the router/gating modules to record selection decisions.
+    Monet has two routers per layer (one per product-key axis); the axis
+    for each router is inferred from its name.
 
     Args:
         model: Monet model with router modules.
@@ -23,7 +30,7 @@ def compute_activation_frequencies(
         device: Device for inference.
 
     Returns:
-        Dict mapping expert name (e.g., 'layer3_expert7') -> frequency (0-1).
+        Dict mapping half-expert name (e.g., 'layer3_axis0_he17') -> frequency (0-1).
     """
     from monet_logic_circuit.models.monet_loader import get_router_modules
 
@@ -31,38 +38,40 @@ def compute_activation_frequencies(
     model = model.to(device)
     model.eval()
 
-    # Track per-layer expert selection counts
-    selection_counts: dict[str, np.ndarray] = {}
+    # Track per-(layer, axis) half-expert selection counts
+    selection_counts: dict[tuple[int, int], np.ndarray] = {}
     total_tokens = 0
     handles = []
 
     routers = get_router_modules(model)
 
     for router_name, router_module in routers:
-        # Parse layer index from router name
         layer_idx = _extract_layer_idx(router_name)
+        axis = _extract_axis(router_name)
 
-        def make_hook(lidx):
+        def make_hook(lidx, ax):
             def hook(module, input, output):
-                # Router output is typically (routing_weights, selected_experts)
+                # Router output is typically (routing_weights, selected_indices)
                 # or just the gating logits. Handle both patterns.
                 if isinstance(output, tuple) and len(output) >= 2:
-                    selected = output[1]  # Expert indices
+                    selected = output[1]
                 else:
                     selected = output.argmax(dim=-1) if output.dim() > 1 else output
 
-                key = f"layer{lidx}"
+                key = (lidx, ax)
                 if key not in selection_counts:
-                    # Will be initialized on first call when we know num_experts
-                    num_experts = output.shape[-1] if output.dim() > 1 else int(selected.max()) + 1
-                    selection_counts[key] = np.zeros(num_experts)
+                    num_half_experts = (
+                        output.shape[-1] if output.dim() > 1
+                        else int(selected.max()) + 1
+                    )
+                    selection_counts[key] = np.zeros(num_half_experts)
 
                 for idx in selected.flatten().cpu().numpy():
                     selection_counts[key][idx] += 1
 
             return hook
 
-        handle = router_module.register_forward_hook(make_hook(layer_idx))
+        handle = router_module.register_forward_hook(make_hook(layer_idx, axis))
         handles.append(handle)
 
     with torch.no_grad():
@@ -76,23 +85,23 @@ def compute_activation_frequencies(
 
     # Normalize to frequencies
     frequencies = {}
-    for layer_key, counts in selection_counts.items():
-        for expert_idx, count in enumerate(counts):
-            name = f"{layer_key}_expert{expert_idx}"
+    for (layer_idx, axis), counts in selection_counts.items():
+        for he_idx, count in enumerate(counts):
+            name = f"layer{layer_idx}_axis{axis}_he{he_idx}"
             frequencies[name] = float(count / total_tokens) if total_tokens > 0 else 0.0
 
     return frequencies
 
 
-def cluster_experts(
-    expert_features: np.ndarray,
+def cluster_half_experts(
+    half_expert_features: np.ndarray,
     num_clusters: int | str = "auto",
     max_clusters: int = 20,
 ) -> tuple[np.ndarray, int]:
-    """Cluster experts by their feature vectors (input/output statistics).
+    """Cluster half-experts by their feature vectors (input/output statistics).
 
     Args:
-        expert_features: (num_experts, feature_dim) array of per-expert features.
+        half_expert_features: (num_half_experts, feature_dim) feature array.
         num_clusters: Number of clusters, or 'auto' for elbow method.
         max_clusters: Maximum clusters to try for elbow method.
 
@@ -102,20 +111,20 @@ def cluster_experts(
     from scipy.cluster.hierarchy import fcluster, linkage
     from scipy.spatial.distance import pdist
 
-    if len(expert_features) < 2:
-        return np.zeros(len(expert_features), dtype=int), 1
+    if len(half_expert_features) < 2:
+        return np.zeros(len(half_expert_features), dtype=int), 1
 
     # Normalize features
-    mean = expert_features.mean(axis=0)
-    std = expert_features.std(axis=0) + 1e-10
-    normalized = (expert_features - mean) / std
+    mean = half_expert_features.mean(axis=0)
+    std = half_expert_features.std(axis=0) + 1e-10
+    normalized = (half_expert_features - mean) / std
 
     distances = pdist(normalized, metric="euclidean")
     Z = linkage(distances, method="ward")
 
     if num_clusters == "auto":
         # Elbow method on within-cluster variance
-        max_k = min(max_clusters, len(expert_features) - 1)
+        max_k = min(max_clusters, len(half_expert_features) - 1)
         inertias = []
         for k in range(1, max_k + 1):
             labels = fcluster(Z, t=k, criterion="maxclust")
@@ -129,53 +138,51 @@ def cluster_experts(
 
 
 def analyze_expert_population(
-    experts,
+    half_experts,
     trace_store,
     frequencies: Optional[dict[str, float]] = None,
 ) -> dict:
-    """Run full expert population analysis.
+    """Run full half-expert population analysis.
 
     Args:
-        experts: ExpertPopulation instance.
+        half_experts: HalfExpertPopulation instance.
         trace_store: ExpertTraceStore with cached calibration traces.
         frequencies: Optional pre-computed activation frequencies.
 
     Returns:
         Dict with analysis results: stats summary, cluster assignments, etc.
     """
-    from monet_logic_circuit.models.expert_wrapper import ExpertPopulation
-
-    # Compute per-expert statistics from traces
+    # Compute per-half-expert statistics from traces
     feature_list = []
-    for expert in experts:
-        if trace_store.has_traces(expert.name):
-            inputs, outputs = trace_store.load_traces(expert.name)
-            expert.compute_input_stats(inputs)
-            expert.compute_output_stats(outputs)
+    for he in half_experts:
+        if trace_store.has_traces(he.name):
+            inputs, outputs = trace_store.load_traces(he.name)
+            he.compute_input_stats(inputs)
+            he.compute_output_stats(outputs)
 
-            if frequencies and expert.name in frequencies:
-                expert.stats.activation_frequency = frequencies[expert.name]
+            if frequencies and he.name in frequencies:
+                he.stats.activation_frequency = frequencies[he.name]
 
             # Build feature vector for clustering
             features = np.concatenate([
-                expert.stats.input_mean[:10] if expert.stats.input_mean is not None else np.zeros(10),
-                expert.stats.output_mean[:10] if expert.stats.output_mean is not None else np.zeros(10),
-                [expert.stats.input_effective_rank],
-                [expert.stats.activation_frequency],
+                he.stats.input_mean[:10] if he.stats.input_mean is not None else np.zeros(10),
+                he.stats.output_mean[:10] if he.stats.output_mean is not None else np.zeros(10),
+                [he.stats.input_effective_rank],
+                [he.stats.activation_frequency],
             ])
             feature_list.append(features)
 
     # Cluster
     if feature_list:
         feature_array = np.stack(feature_list)
-        labels, k = cluster_experts(feature_array)
-        for i, expert in enumerate(experts):
+        labels, k = cluster_half_experts(feature_array)
+        for i, he in enumerate(half_experts):
             if i < len(labels):
-                expert.stats.cluster_id = int(labels[i])
+                he.stats.cluster_id = int(labels[i])
     else:
         k = 0
 
-    summary = experts.get_stats_summary()
+    summary = half_experts.get_stats_summary()
     summary["num_clusters"] = k
 
     return summary
@@ -190,6 +197,23 @@ def _extract_layer_idx(name: str) -> int:
                 return int(parts[i + 1])
             except ValueError:
                 continue
+    return 0
+
+
+def _extract_axis(name: str) -> int:
+    """Extract product-key axis (0 or 1) from a router module name.
+
+    Monet's two per-layer routers are typically distinguished by an
+    ``axis``/``dim`` index or a ``h`` vs ``v`` suffix. Defaults to 0 when
+    no signal is available.
+    """
+    lowered = name.lower()
+    for token in ("axis1", "axis_1", "dim1", "dim_1", "_v_", ".v.", "right", "top"):
+        if token in lowered:
+            return 1
+    for token in ("axis0", "axis_0", "dim0", "dim_0", "_h_", ".h.", "left", "bottom"):
+        if token in lowered:
+            return 0
     return 0
 
 

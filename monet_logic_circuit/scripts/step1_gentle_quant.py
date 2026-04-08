@@ -27,7 +27,7 @@ from monet_logic_circuit.eval.downstream import (
 from monet_logic_circuit.eval.profiling import profile_model
 from monet_logic_circuit.quantization.gentle import (
     apply_gentle_quantization,
-    measure_per_expert_reconstruction,
+    measure_per_half_expert_reconstruction,
 )
 
 
@@ -52,6 +52,7 @@ def main():
     model, model_config = load_monet_model(
         config["model"]["checkpoint"],
         device=config["model"]["device"],
+        allowed_decompositions=config["model"].get("allowed_decompositions"),
     )
     tokenizer = _load_tokenizer(config["model"]["checkpoint"])
     device = next(model.parameters()).device
@@ -116,12 +117,14 @@ def main():
             results["downstream_delta"] = deltas
             print(format_results_table(downstream, baseline_results.get("downstream")))
 
-    # Per-expert reconstruction error
+    # Per-half-expert reconstruction error
     if config["expert_analysis"]["per_expert_reconstruction_error"]:
-        print("Measuring per-expert reconstruction error...")
+        print("Measuring per-half-expert reconstruction error...")
         trace_store = ExpertTraceStore(baseline_dir / "traces")
-        errors = measure_per_expert_reconstruction(model, quantized_model, trace_store)
-        results["per_expert_reconstruction_error"] = errors
+        errors = measure_per_half_expert_reconstruction(
+            model, quantized_model, trace_store
+        )
+        results["per_half_expert_reconstruction_error"] = errors
         if errors:
             import numpy as np
             err_vals = list(errors.values())

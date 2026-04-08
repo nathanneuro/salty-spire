@@ -22,7 +22,7 @@ class QuantizationSweepConfig:
         default_factory=lambda: ["weights_only", "weights_and_activations"]
     )
     scale_options: list[str] = field(
-        default_factory=lambda: ["per_tensor", "per_channel", "per_expert"]
+        default_factory=lambda: ["per_tensor", "per_channel", "per_half_expert"]
     )
 
     def num_configs(self) -> int:
@@ -39,15 +39,16 @@ class TernaryQuantizer(nn.Module):
     """BitNet-style ternary quantization: weights in {-1, 0, +1}.
 
     Implements quantization-aware training via straight-through estimator.
-    Each expert gets its own learned scale factor.
+    Each half-expert gets its own learned scale factor when
+    ``scale_per_half_expert`` is true.
     """
 
-    def __init__(self, weight: torch.Tensor, scale_per_expert: bool = True):
+    def __init__(self, weight: torch.Tensor, scale_per_half_expert: bool = True):
         super().__init__()
         self.register_buffer("shape", torch.tensor(weight.shape))
 
-        # Learned scale factor (one per output channel if per-expert)
-        if scale_per_expert:
+        # Learned scale factor (one per output channel if per-half-expert)
+        if scale_per_half_expert:
             self.scale = nn.Parameter(weight.abs().mean(dim=-1, keepdim=True))
         else:
             self.scale = nn.Parameter(torch.tensor(weight.abs().mean()))
@@ -126,26 +127,26 @@ def apply_aggressive_quantization(
     model: nn.Module,
     bits: float = 1.58,
     scope: str = "weights_only",
-    scale_granularity: str = "per_expert",
+    scale_granularity: str = "per_half_expert",
 ) -> nn.Module:
-    """Replace expert FFN linear layers with aggressively quantized versions.
+    """Replace half-expert linear layers with aggressively quantized versions.
 
     Args:
         model: Monet model to quantize.
         bits: Bit width (1.0, 1.58, or 2.0).
         scope: 'weights_only' or 'weights_and_activations'.
-        scale_granularity: 'per_tensor', 'per_channel', or 'per_expert'.
+        scale_granularity: 'per_tensor', 'per_channel', or 'per_half_expert'.
 
     Returns:
-        Model with quantized expert layers (modified in place).
+        Model with quantized half-expert layers (modified in place).
     """
-    from monet_logic_circuit.models.monet_loader import get_expert_modules
+    from monet_logic_circuit.models.monet_loader import get_half_expert_modules
 
     quantizer_cls = _get_quantizer_class(bits)
-    experts = get_expert_modules(model)
+    half_experts = get_half_expert_modules(model)
 
-    for name, expert_module in experts:
-        _replace_linear_layers(expert_module, quantizer_cls, scale_granularity)
+    for name, half_expert_module in half_experts:
+        _replace_linear_layers(half_expert_module, quantizer_cls, scale_granularity)
 
     return model
 
@@ -206,30 +207,30 @@ def compute_effective_output_cardinality(
     trace_store,
     tolerance: float = 1e-4,
 ) -> dict[str, int]:
-    """Measure effective number of distinct outputs per expert after quantization.
+    """Measure effective number of distinct outputs per half-expert after quantization.
 
-    Low cardinality indicates the expert has collapsed to few modes and is
-    a candidate for extreme compression or removal.
+    Low cardinality indicates the half-expert has collapsed to few modes and
+    is a candidate for extreme compression or removal.
     """
-    from monet_logic_circuit.models.monet_loader import get_expert_modules
+    from monet_logic_circuit.models.monet_loader import get_half_expert_modules
 
     cardinalities = {}
-    experts = dict(get_expert_modules(model))
+    half_experts = dict(get_half_expert_modules(model))
 
-    for expert_name in trace_store.list_experts():
-        if expert_name not in experts:
+    for half_expert_name in trace_store.list_experts():
+        if half_expert_name not in half_experts:
             continue
 
-        inputs, _ = trace_store.load_traces(expert_name)
-        expert = experts[expert_name]
+        inputs, _ = trace_store.load_traces(half_expert_name)
+        he = half_experts[half_expert_name]
 
         with torch.no_grad():
-            outputs = expert(inputs.to(next(expert.parameters()).device)).cpu()
+            outputs = he(inputs.to(next(he.parameters()).device)).cpu()
 
         flat = outputs.reshape(-1, outputs.shape[-1]).float()
         quantized = (flat / tolerance).round()
         unique = torch.unique(quantized, dim=0)
-        cardinalities[expert_name] = len(unique)
+        cardinalities[half_expert_name] = len(unique)
 
     return cardinalities
 
@@ -252,10 +253,14 @@ def _replace_linear_layers(
     """Recursively replace nn.Linear layers in a module with quantized versions."""
     for name, child in list(module.named_children()):
         if isinstance(child, nn.Linear):
-            per_expert = scale_granularity == "per_expert"
+            per_half_expert = scale_granularity == "per_half_expert"
             quantized = quantizer_cls(
                 child.weight.data,
-                **({"scale_per_expert": per_expert} if quantizer_cls == TernaryQuantizer else {}),
+                **(
+                    {"scale_per_half_expert": per_half_expert}
+                    if quantizer_cls == TernaryQuantizer
+                    else {}
+                ),
             )
             setattr(module, name, quantized)
         else:

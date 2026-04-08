@@ -119,14 +119,14 @@ def _apply_awq(
     return model_quant.model
 
 
-def measure_per_expert_reconstruction(
+def measure_per_half_expert_reconstruction(
     original_model: nn.Module,
     quantized_model: nn.Module,
     trace_store,
 ) -> dict[str, float]:
-    """Measure per-expert reconstruction error: quantized vs float output.
+    """Measure per-half-expert reconstruction error: quantized vs float output.
 
-    Uses cached calibration traces from Step 0 to evaluate each expert
+    Uses cached calibration traces from Step 0 to evaluate each half-expert
     individually.
 
     Args:
@@ -135,28 +135,28 @@ def measure_per_expert_reconstruction(
         trace_store: ExpertTraceStore with Step 0 traces.
 
     Returns:
-        Dict mapping expert_name -> normalized MSE.
+        Dict mapping half-expert name -> normalized MSE.
     """
-    from monet_logic_circuit.models.monet_loader import get_expert_modules
+    from monet_logic_circuit.models.monet_loader import get_half_expert_modules
 
     errors = {}
-    quant_experts = dict(get_expert_modules(quantized_model))
+    quant_half_experts = dict(get_half_expert_modules(quantized_model))
 
-    for expert_name in trace_store.list_experts():
-        inputs, ref_outputs = trace_store.load_traces(expert_name)
+    for half_expert_name in trace_store.list_experts():
+        inputs, ref_outputs = trace_store.load_traces(half_expert_name)
 
-        if expert_name not in quant_experts:
+        if half_expert_name not in quant_half_experts:
             continue
 
-        quant_expert = quant_experts[expert_name]
+        quant_he = quant_half_experts[half_expert_name]
         with torch.no_grad():
-            quant_outputs = quant_expert(inputs.to(next(quant_expert.parameters()).device))
+            quant_outputs = quant_he(inputs.to(next(quant_he.parameters()).device))
             quant_outputs = quant_outputs.cpu()
 
         mse = ((ref_outputs.float() - quant_outputs.float()) ** 2).mean()
         ref_var = ref_outputs.float().var()
         nmse = float(mse / (ref_var + 1e-10))
-        errors[expert_name] = nmse
+        errors[half_expert_name] = nmse
 
     return errors
 

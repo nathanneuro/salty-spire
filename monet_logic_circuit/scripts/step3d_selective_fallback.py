@@ -1,6 +1,6 @@
 """Step 3d: Selective fallback for the long tail.
 
-Experts that couldn't be converted cleanly stay as quantized float.
+Half-experts that couldn't be converted cleanly stay as quantized float.
 Measures the final hybrid model with honest speedup numbers.
 
 Usage:
@@ -54,26 +54,29 @@ def main():
     model, model_config = load_monet_model(
         config["model"]["base_checkpoint"],
         device=config["model"]["device"],
+        allowed_decompositions=config["model"].get("allowed_decompositions"),
     )
     tokenizer = _load_tokenizer(config["model"]["base_checkpoint"])
     device = next(model.parameters()).device
 
-    # Classify experts into circuit vs fallback
+    # Classify half-experts into circuit vs fallback
     threshold = config["fallback"]["reconstruction_error_threshold"]
-    force_quantized = set(config["fallback"].get("force_quantized_experts", []))
+    force_quantized = set(
+        config["fallback"].get("force_quantized_half_experts", [])
+    )
 
     circuits = {}
     quantized_fallbacks = {}
-    per_expert_stats = []
+    per_half_expert_stats = []
 
-    decisions = conversion_results.get("per_expert_decisions", {})
+    decisions = conversion_results.get("per_half_expert_decisions", {})
     for name, decision in decisions.items():
         recon_error = decision.get("reconstruction_error", 0)
 
         if name in force_quantized or recon_error > threshold:
             # Fallback to quantized float
             quantized_fallbacks[name] = None  # Would load actual module
-            per_expert_stats.append({
+            per_half_expert_stats.append({
                 "name": name,
                 "method": "quantized_float",
                 "reconstruction_error": recon_error,
@@ -81,19 +84,19 @@ def main():
             })
         else:
             circuits[name] = None  # Would load actual circuit
-            per_expert_stats.append({
+            per_half_expert_stats.append({
                 "name": name,
                 "method": decision.get("method", "learned"),
                 "reconstruction_error": recon_error,
                 "gates": decision.get("gates", 0),
             })
 
-    total = len(per_expert_stats)
-    n_circuit = sum(1 for s in per_expert_stats if s["method"] != "quantized_float")
+    total = len(per_half_expert_stats)
+    n_circuit = sum(1 for s in per_half_expert_stats if s["method"] != "quantized_float")
     n_fallback = total - n_circuit
     fallback_frac = n_fallback / total if total > 0 else 0
 
-    print(f"\nExpert conversion breakdown:")
+    print(f"\nHalf-expert conversion breakdown:")
     print(f"  Logic circuits: {n_circuit}/{total} ({n_circuit/total*100:.1f}%)")
     print(f"  Quantized fallback: {n_fallback}/{total} ({fallback_frac*100:.1f}%)")
 
@@ -111,7 +114,8 @@ def main():
         base_model=model,
         circuits=circuits,
         quantized_fallbacks=quantized_fallbacks,
-        hidden_dim=model_config.hidden_dim,
+        half_expert_input_dim=model_config.hidden_dim // 2,
+        half_expert_output_dim=model_config.expert_dim,
         binarizer_config={"method": "sign", "bits": 1},
     )
 
@@ -163,14 +167,14 @@ def main():
 
     # Conversion statistics
     results["conversion_stats"] = {
-        "total_experts": total,
-        "exact_circuit": sum(1 for s in per_expert_stats if s["method"] == "exact"),
-        "learned_circuit": sum(1 for s in per_expert_stats if s["method"] == "learned"),
+        "total_half_experts": total,
+        "exact_circuit": sum(1 for s in per_half_expert_stats if s["method"] == "exact"),
+        "learned_circuit": sum(1 for s in per_half_expert_stats if s["method"] == "learned"),
         "quantized_float": n_fallback,
         "circuit_fraction": n_circuit / total if total > 0 else 0,
         "fallback_fraction": fallback_frac,
     }
-    results["per_expert_stats"] = per_expert_stats
+    results["per_half_expert_stats"] = per_half_expert_stats
 
     # Final verdict
     print("\n" + "=" * 60)

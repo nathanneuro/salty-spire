@@ -1,15 +1,17 @@
 experiment: step3c_end_to_end
 
 model:
-  base_checkpoint: null  # Original pretrained Monet
+  base_checkpoint: MonetLLM/monet-vd-850M-100BT-hf
   ternary_checkpoint: outputs/step2/ternary_model
-  circuits_dir: outputs/step3b  # Contains per-expert circuit decisions
+  circuits_dir: outputs/step3b  # Contains per-half-expert circuit decisions
   device: auto
+  allowed_decompositions: [vd]
 
 hybrid_inference:
-  router: float          # Router stays in float precision
-  experts: logic_circuit  # Experts replaced with logic circuits
-  attention: float        # Attention stays in float
+  routers: float           # Both product-key routers stay in float precision
+  half_experts: logic_circuit  # Half-experts replaced with logic circuits
+  expert_composition: vd_additive  # Sum of left/right half-expert outputs
+  attention: float         # Attention stays in float
   norms: float
 
   input_binarization:
@@ -18,7 +20,7 @@ hybrid_inference:
     multi_bit_fallback: 4  # If binary fails, try this many bits
 
   output_decoding:
-    per_expert: true       # Learned decoder per expert
+    per_half_expert: true  # Learned decoder per half-expert
     hidden_dim: 64         # Small decoder MLP hidden dim
 
 eval:

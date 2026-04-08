@@ -1,7 +1,8 @@
 """Step 3b: Learned converter for approximate logic circuits.
 
-Trains a model to map (quantized expert weights, input distribution stats)
--> (approximate logic circuit) for experts where exact conversion is too expensive.
+Trains a model to map (quantized half-expert weights, input distribution
+stats) -> (approximate logic circuit) for half-experts where exact
+conversion is too expensive.
 
 Usage:
     python -m monet_logic_circuit.scripts.step3b_learned_converter --config configs/step3b_learned_converter.yaml
@@ -16,7 +17,10 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader, random_split
 
-from monet_logic_circuit.models.monet_loader import load_monet_model, get_expert_modules
+from monet_logic_circuit.models.monet_loader import (
+    load_monet_model,
+    get_half_expert_modules,
+)
 from monet_logic_circuit.data.expert_traces import ExpertTraceStore
 from monet_logic_circuit.conversion.learned import (
     CircuitConverter,
@@ -25,11 +29,11 @@ from monet_logic_circuit.conversion.learned import (
 )
 
 
-class ExpertDataset(Dataset):
-    """Dataset of (expert_params, input_stats, target_circuit) tuples."""
+class HalfExpertDataset(Dataset):
+    """Dataset of (half_expert_params, input_stats, target_circuit) tuples."""
 
-    def __init__(self, expert_data: list[dict]):
-        self.data = expert_data
+    def __init__(self, half_expert_data: list[dict]):
+        self.data = half_expert_data
 
     def __len__(self):
         return len(self.data)
@@ -37,7 +41,7 @@ class ExpertDataset(Dataset):
     def __getitem__(self, idx):
         d = self.data[idx]
         return {
-            "expert_params": d["params"],
+            "half_expert_params": d["params"],
             "input_stats": d["stats"],
             "name": d["name"],
         }
@@ -54,22 +58,23 @@ def main():
     output_dir = Path(config["outputs"]["dir"])
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Load model and expert data
+    # Load model and half-expert data
     print("Loading ternary model...")
     model, model_config = load_monet_model(
         config["model"]["ternary_checkpoint"],
         device=config["model"]["device"],
+        allowed_decompositions=config["model"].get("allowed_decompositions"),
     )
 
     trace_store = ExpertTraceStore(config["converter"]["training"]["calibration_traces_dir"])
 
-    # Build expert dataset: extract params + input stats for each expert
-    print("Building expert dataset...")
-    all_experts = get_expert_modules(model)
-    expert_data = []
+    # Build half-expert dataset: extract params + input stats for each half-expert
+    print("Building half-expert dataset...")
+    all_half_experts = get_half_expert_modules(model)
+    half_expert_data = []
 
-    for name, expert_module in all_experts:
-        params = torch.cat([p.flatten() for p in expert_module.parameters()]).detach()
+    for name, he_module in all_half_experts:
+        params = torch.cat([p.flatten() for p in he_module.parameters()]).detach()
 
         # Get input stats from traces
         stats = torch.zeros(21)  # Default
@@ -81,19 +86,19 @@ def main():
             eff_rank = torch.tensor([float(flat.shape[-1])])  # Placeholder
             stats = torch.cat([mean, var, eff_rank])
 
-        expert_data.append({"name": name, "params": params, "stats": stats})
+        half_expert_data.append({"name": name, "params": params, "stats": stats})
 
     # Determine dimensions
-    expert_param_dim = expert_data[0]["params"].shape[0]
-    input_stat_dim = expert_data[0]["stats"].shape[0]
+    half_expert_param_dim = half_expert_data[0]["params"].shape[0]
+    input_stat_dim = half_expert_data[0]["stats"].shape[0]
 
     # Split into train/val
-    dataset = ExpertDataset(expert_data)
+    dataset = HalfExpertDataset(half_expert_data)
     n_val = max(1, len(dataset) // 5)
     n_train = len(dataset) - n_val
     train_set, val_set = random_split(dataset, [n_train, n_val])
 
-    print(f"  Train: {n_train} experts, Val: {n_val} experts")
+    print(f"  Train: {n_train} half-experts, Val: {n_val} half-experts")
 
     # Build converter
     conv_config = ConverterConfig(
@@ -108,7 +113,7 @@ def main():
         min_temperature=config["converter"]["training"]["relaxation"]["min_temperature"],
     )
 
-    converter = CircuitConverter(conv_config, expert_param_dim, input_stat_dim)
+    converter = CircuitConverter(conv_config, half_expert_param_dim, input_stat_dim)
     trainer = ConverterTrainer(converter, conv_config, device=str(next(model.parameters()).device))
 
     # Training loop
@@ -127,7 +132,7 @@ def main():
                 break
 
             losses = trainer.train_step(
-                expert_params=batch["expert_params"],
+                expert_params=batch["half_expert_params"],
                 input_stats=batch["input_stats"],
             )
             train_losses.append(losses)
@@ -150,16 +155,16 @@ def main():
     print(f"  Train reconstruction error: mean={train_metrics['mean_error']:.6f}")
     print(f"  Val reconstruction error: mean={val_metrics['mean_error']:.6f}")
 
-    # Convert all experts and decide per-expert: exact (3a) or learned (3b)
-    print("\nConverting all experts...")
+    # Convert all half-experts and decide per-half-expert: exact (3a) or learned (3b)
+    print("\nConverting all half-experts...")
     exact_results_path = Path(config["converter"]["training"]["supervised_data_dir"]).parent / "results.json"
     exact_results = {}
     if exact_results_path.exists():
         with open(exact_results_path) as f:
             exact_results = json.load(f)
 
-    per_expert_decisions = _make_per_expert_decisions(
-        converter, expert_data, exact_results, model_config, trace_store,
+    per_half_expert_decisions = _make_per_half_expert_decisions(
+        converter, half_expert_data, exact_results, model_config, trace_store,
     )
 
     # Save
@@ -170,11 +175,11 @@ def main():
             "val_metrics": val_metrics,
             "total_steps": step,
         },
-        "per_expert_decisions": per_expert_decisions,
+        "per_half_expert_decisions": per_half_expert_decisions,
         "summary": {
-            "exact_circuit": sum(1 for d in per_expert_decisions.values() if d["method"] == "exact"),
-            "learned_circuit": sum(1 for d in per_expert_decisions.values() if d["method"] == "learned"),
-            "total": len(per_expert_decisions),
+            "exact_circuit": sum(1 for d in per_half_expert_decisions.values() if d["method"] == "exact"),
+            "learned_circuit": sum(1 for d in per_half_expert_decisions.values() if d["method"] == "learned"),
+            "total": len(per_half_expert_decisions),
         },
     }
 
@@ -204,21 +209,23 @@ def _evaluate_converter(converter, dataset, trace_store, model_config):
     }
 
 
-def _make_per_expert_decisions(converter, expert_data, exact_results, model_config, trace_store):
-    """Decide per-expert: use exact circuit (3a) or learned circuit (3b)."""
-    exact_experts = {}
-    if "per_expert" in exact_results:
-        for e in exact_results["per_expert"]:
+def _make_per_half_expert_decisions(
+    converter, half_expert_data, exact_results, model_config, trace_store
+):
+    """Decide per-half-expert: use exact circuit (3a) or learned circuit (3b)."""
+    exact_half_experts = {}
+    if "per_half_expert" in exact_results:
+        for e in exact_results["per_half_expert"]:
             if e["size_class"] in ("small", "tractable"):
-                exact_experts[e["name"]] = e
+                exact_half_experts[e["name"]] = e
 
     decisions = {}
-    for ed in expert_data:
+    for ed in half_expert_data:
         name = ed["name"]
-        if name in exact_experts:
+        if name in exact_half_experts:
             decisions[name] = {
                 "method": "exact",
-                "gates": exact_experts[name]["gates_after"],
+                "gates": exact_half_experts[name]["gates_after"],
             }
         else:
             decisions[name] = {

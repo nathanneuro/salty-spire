@@ -2,9 +2,12 @@ experiment: step3b_learned_converter
 
 model:
   ternary_checkpoint: outputs/step2/ternary_model
+  source_checkpoint: MonetLLM/monet-vd-850M-100BT-hf
   device: auto
+  allowed_decompositions: [vd]
 
 converter:
+  granularity: half_expert  # One circuit per half-expert; composition is VD-additive
   architecture:
     output_format: fixed_topology  # Gate-choice logits on fixed wiring
     topology:
@@ -15,8 +18,8 @@ converter:
     gate_types: [AND, OR, XOR, NAND, NOR, XNOR, BUF, NOT]
 
   training:
-    supervised_data_dir: outputs/step3a/circuits  # Expert->circuit pairs from 3a
-    calibration_traces_dir: outputs/step0/traces
+    supervised_data_dir: outputs/step3a/circuits  # Half-expert->circuit pairs from 3a
+    calibration_traces_dir: outputs/step0/traces  # Per-half-expert (input, output) traces
 
     loss:
       supervised_weight: 1.0       # Match known-good circuits from 3a
@@ -32,8 +35,9 @@ converter:
     batch_size: 32
     max_steps: 50000
     eval_interval: 1000
-    num_train_experts: null   # Auto-split from available experts
-    num_val_experts: null
+    num_train_half_experts: null   # Auto-split from available half-experts
+    num_val_half_experts: null
+    stratify_by: [layer_idx, axis]  # Axis = which product-key axis (0 or 1)
 
     relaxation:
       method: straight_through  # STE for discrete gate selection
@@ -42,12 +46,13 @@ converter:
       min_temperature: 0.1
 
 eval:
-  per_expert_reconstruction_error: true
+  per_half_expert_reconstruction_error: true
   circuit_size_distribution: true
-  generalization_to_unseen: true  # Test on experts not in training set
+  generalization_to_unseen: true         # Test on half-experts not in training set
+  composed_effective_expert_error: true  # End-to-end: compose half-experts and measure effective-expert reconstruction
 
 outputs:
   dir: outputs/step3b
   save_converter_model: true
   save_converted_circuits: true
-  save_per_expert_decisions: true  # Exact (from 3a) vs learned (from 3b) per expert
+  save_per_half_expert_decisions: true   # Exact (from 3a) vs learned (from 3b) per half-expert

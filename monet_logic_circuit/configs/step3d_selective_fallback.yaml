@@ -1,16 +1,18 @@
 experiment: step3d_selective_fallback
 
 model:
-  base_checkpoint: null
+  base_checkpoint: MonetLLM/monet-vd-850M-100BT-hf
   ternary_checkpoint: outputs/step2/ternary_model
   circuits_dir: outputs/step3b
   hybrid_model_dir: outputs/step3c
   device: auto
+  allowed_decompositions: [vd]
 
 fallback:
-  # Experts that failed conversion stay as quantized float
-  reconstruction_error_threshold: 0.05  # Max acceptable per-expert error
-  force_quantized_experts: []           # Manual override list
+  # Half-experts that failed conversion stay as quantized float
+  granularity: half_expert
+  reconstruction_error_threshold: 0.05    # Max acceptable per-half-expert error
+  force_quantized_half_experts: []        # Manual override list of (layer, axis, idx)
   strategy: auto  # auto selects based on threshold; manual uses force list
 
 eval:
@@ -41,8 +43,8 @@ outputs:
   dir: outputs/step3d
   save_final_model: true
   save_conversion_report: true
-  save_per_expert_stats: true  # (method, circuit_size, reconstruction_error, activation_freq)
+  save_per_half_expert_stats: true  # (layer, axis, idx, method, circuit_size, reconstruction_error, activation_freq)
 
 targets:
-  max_fallback_fraction: 0.10  # Aim for <10% experts staying quantized
+  max_fallback_fraction: 0.10  # Aim for <10% half-experts staying quantized
   warning_threshold: 0.30      # >30% means converter needs improvement

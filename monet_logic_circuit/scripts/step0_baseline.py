@@ -4,8 +4,8 @@ Establishes ground truth numbers that every subsequent step is measured against:
 - Perplexity on held-out data
 - Downstream task accuracy
 - Inference profiling (speed, memory, per-component FLOP breakdown)
-- Expert population characterization (activation frequency, input/output stats, clustering)
-- Cached per-expert (input, output) calibration traces
+- Half-expert population characterization (activation frequency, input/output stats, clustering)
+- Cached per-half-expert (input, output) calibration traces
 
 Usage:
     python -m monet_logic_circuit.scripts.step0_baseline --config configs/step0_baseline.yaml
@@ -20,9 +20,12 @@ import torch
 
 from monet_logic_circuit.models.monet_loader import (
     load_monet_model,
-    get_expert_modules,
+    get_half_expert_modules,
 )
-from monet_logic_circuit.models.expert_wrapper import ExpertWrapper, ExpertPopulation
+from monet_logic_circuit.models.expert_wrapper import (
+    HalfExpertPopulation,
+    HalfExpertWrapper,
+)
 from monet_logic_circuit.data.calibration import (
     load_calibration_data,
     save_calibration_cache,
@@ -53,6 +56,7 @@ def main():
     model, model_config = load_monet_model(
         config["model"]["checkpoint"],
         device=config["model"]["device"],
+        allowed_decompositions=config["model"].get("allowed_decompositions"),
     )
     tokenizer = _load_tokenizer(config["model"]["checkpoint"])
     device = next(model.parameters()).device
@@ -117,7 +121,7 @@ def main():
 
         flops = estimate_flops_per_token(
             model_config.num_layers, model_config.hidden_dim,
-            model_config.expert_hidden_dim, model_config.num_attention_heads,
+            model_config.expert_dim, model_config.num_attention_heads,
             model_config.vocab_size, model_config.top_k,
             config["profiling"]["sequence_length"],
         )
@@ -127,39 +131,47 @@ def main():
         print(f"  Tokens/sec (GPU): {profile.tokens_per_sec_gpu:.0f}")
         print(f"  Peak memory: {profile.peak_memory_mb:.0f} MB")
 
-    # Expert population analysis
+    # Half-expert population analysis
     if config["expert_analysis"]["enabled"]:
-        print("Analyzing expert population...")
+        print("Analyzing half-expert population...")
 
-        # Wrap experts
-        raw_experts = get_expert_modules(model)
+        # Wrap half-experts. Naming convention (layerL_axisA_heH) is set
+        # by HalfExpertWrapper; loaders produce per-layer per-axis modules
+        # in a canonical order so we can index them deterministically.
+        raw_half_experts = get_half_expert_modules(model)
+        n_per_axis = model_config.num_half_experts_per_axis
+        per_layer = 2 * n_per_axis  # two axes
         wrapped = []
-        for i, (name, mod) in enumerate(raw_experts):
-            layer_idx = i // model_config.num_experts_per_layer
-            expert_idx = i % model_config.num_experts_per_layer
-            wrapped.append(ExpertWrapper(mod, layer_idx, expert_idx))
-        population = ExpertPopulation(wrapped)
+        for i, (name, mod) in enumerate(raw_half_experts):
+            layer_idx = i // per_layer
+            within_layer = i % per_layer
+            axis = 0 if within_layer < n_per_axis else 1
+            half_expert_idx = within_layer % n_per_axis
+            wrapped.append(
+                HalfExpertWrapper(mod, layer_idx, axis, half_expert_idx)
+            )
+        population = HalfExpertPopulation(wrapped)
 
         # Collect traces
         trace_store = ExpertTraceStore(config["traces"]["output_dir"])
         if config["traces"]["save"]:
-            print("  Collecting expert traces...")
+            print("  Collecting half-expert traces...")
             cal_loader = torch.utils.data.DataLoader(cal_data, batch_size=1)
 
-            for expert in population:
-                expert.start_tracing()
+            for half_expert in population:
+                half_expert.start_tracing()
 
             # Run calibration data through model
             with torch.no_grad():
                 for batch in cal_loader:
                     model(batch["input_ids"].to(device))
 
-            for expert in population:
-                inputs, outputs = expert.stop_tracing()
+            for half_expert in population:
+                inputs, outputs = half_expert.stop_tracing()
                 if len(inputs) > 0:
-                    trace_store.save_traces(expert.name, inputs, outputs)
+                    trace_store.save_traces(half_expert.name, inputs, outputs)
 
-            print(f"  Saved traces for {len(trace_store.list_experts())} experts")
+            print(f"  Saved traces for {len(trace_store.list_experts())} half-experts")
 
         # Activation frequencies
         if config["expert_analysis"]["activation_frequency"]:
@@ -172,7 +184,7 @@ def main():
         # Full analysis
         analysis = analyze_expert_population(population, trace_store, freqs)
         results["expert_analysis"] = analysis
-        print(f"  Experts: {analysis['num_experts']}")
+        print(f"  Half-experts: {analysis['num_half_experts']}")
         print(f"  Clusters: {analysis['num_clusters']}")
 
     # Save all results
