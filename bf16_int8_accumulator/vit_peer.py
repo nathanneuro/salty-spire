@@ -23,6 +23,17 @@ import torch.nn.functional as F
 from accum_linear import AccumLinear
 
 
+class FFNLayer(nn.Module):
+    """Standard 2-layer MLP, wraps AccumLinear for precision tests."""
+    def __init__(self, dim: int, hidden: int, quant: str, master: str):
+        super().__init__()
+        self.fc1 = AccumLinear(dim, hidden, bias=True, quant=quant, master=master)
+        self.fc2 = AccumLinear(hidden, dim, bias=True, quant=quant, master=master)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.fc2(F.gelu(self.fc1(x)))
+
+
 class PEERLayer(nn.Module):
     def __init__(
         self,
@@ -101,16 +112,23 @@ class Block(nn.Module):
         top_k: int,
         quant: str,
         master: str,
+        mlp_type: str = "peer",
+        mlp_hidden_mult: int = 4,
     ):
         super().__init__()
         self.norm1 = nn.LayerNorm(dim)
         self.attn = Attention(dim, num_heads, quant, master)
         self.norm2 = nn.LayerNorm(dim)
-        self.peer = PEERLayer(dim, num_experts, top_k, quant, master)
+        if mlp_type == "peer":
+            self.mlp = PEERLayer(dim, num_experts, top_k, quant, master)
+        elif mlp_type == "ffn":
+            self.mlp = FFNLayer(dim, dim * mlp_hidden_mult, quant, master)
+        else:
+            raise ValueError(f"unknown mlp_type={mlp_type}")
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = x + self.attn(self.norm1(x))
-        x = x + self.peer(self.norm2(x))
+        x = x + self.mlp(self.norm2(x))
         return x
 
 
@@ -128,6 +146,8 @@ class PeerViT(nn.Module):
         in_chans: int = 3,
         quant: str = "int4",
         master: str = "accum",
+        mlp_type: str = "peer",
+        mlp_hidden_mult: int = 4,
     ):
         super().__init__()
         assert image_size % patch_size == 0
@@ -143,7 +163,8 @@ class PeerViT(nn.Module):
 
         self.blocks = nn.ModuleList(
             [
-                Block(dim, num_heads, num_experts, top_k, quant, master)
+                Block(dim, num_heads, num_experts, top_k, quant, master,
+                      mlp_type=mlp_type, mlp_hidden_mult=mlp_hidden_mult)
                 for _ in range(depth)
             ]
         )
