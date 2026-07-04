@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Stumble — a serendipity engine</title>
+  <link rel="stylesheet" href="css/style.css">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='0.9em' font-size='90'>🎲</text></svg>">
+</head>
+<body>
+
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-die">🎲</span>
+      <span class="brand-name">Stumble</span>
+    </div>
+    <nav class="cats" id="cat-toggles" aria-label="Categories"></nav>
+    <button class="ghost-btn" id="taste-btn" title="Your taste profile">✦ taste</button>
+  </header>
+
+  <main class="stage">
+    <section class="card" id="card" aria-live="polite">
+      <div class="welcome" id="welcome">
+        <h1>Stumble</h1>
+        <p>A little serendipity engine, in the spirit of the old StumbleUpon.</p>
+        <p>Hit <strong>Stumble</strong> and it will show you a painting, a poem,
+        a short story, or a song &mdash; pulled live from open archives.
+        Rate what you see with <strong>👍</strong> / <strong>👎</strong> and it
+        learns what you like, nudging future stumbles toward your taste while
+        still wandering enough to surprise you.</p>
+        <p class="welcome-fine">Everything it learns stays in your browser.
+        Keys: <kbd>space</kbd> stumble &nbsp;·&nbsp; <kbd>↑</kbd> like &nbsp;·&nbsp; <kbd>↓</kbd> pass</p>
+      </div>
+    </section>
+  </main>
+
+  <footer class="controls">
+    <button class="rate-btn down" id="btn-down" title="Not my thing (↓)">👎</button>
+    <button class="stumble-btn" id="btn-stumble">Stumble!</button>
+    <button class="rate-btn up" id="btn-up" title="More like this (↑)">👍</button>
+  </footer>
+
+  <aside class="taste-panel" id="taste-panel" hidden>
+    <div class="taste-head">
+      <h2>Your taste</h2>
+      <button class="ghost-btn" id="taste-close">✕</button>
+    </div>
+    <div class="taste-body" id="taste-body"></div>
+    <div class="taste-foot">
+      <button class="ghost-btn danger" id="taste-reset">forget everything</button>
+    </div>
+  </aside>
+
+  <div class="toast" id="toast" hidden></div>
+
+  <script src="js/taste.js"></script>
+  <script src="js/sources.js"></script>
+  <script src="js/app.js"></script>
+</body>
+</html>
